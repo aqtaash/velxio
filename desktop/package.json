@@ -1,0 +1,30 @@
+{
+  "name": "velxio-desktop",
+  "version": "0.1.0",
+  "description": "Velxio - Arduino & embedded board emulator (desktop)",
+  "main": "main.js",
+  "author": "Velxio Desktop <noreply@example.com>",
+  "homepage": "https://github.com/davidmonterocrespo24/velxio",
+  "license": "AGPL-3.0",
+  "scripts": { "start": "electron ." },
+  "dependencies": { "http-proxy": "^1.18.1" },
+  "devDependencies": {
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "dev.velxio.desktop",
+    "productName": "Velxio",
+    "artifactName": "Velxio-${version}-${os}-${arch}.${ext}",
+    "directories": { "output": "dist" },
+    "files": ["main.js"],
+    "extraResources": [{ "from": "resources", "to": "app-resources" }],
+    "linux": {
+      "target": ["AppImage", "deb"],
+      "category": "Development",
+      "maintainer": "Velxio Desktop <noreply@example.com>"
+    },
+    "win": { "target": ["nsis"] },
+    "nsis": { "oneClick": false, "allowToChangeInstallationDirectory": true }
+  }
+}
