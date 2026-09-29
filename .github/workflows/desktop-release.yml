@@ -1,0 +1,114 @@
+name: Build desktop apps (Linux + Windows)
+
+# Runs automatically when you publish a Release on GitHub.
+# You can also run it by hand from the Actions tab (Run workflow).
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  frontend:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Build the web frontend
+        working-directory: frontend
+        run: |
+          rm -f package-lock.json
+          npm install --include=optional
+          npm run build:docker
+      - uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist
+
+  package:
+    needs: frontend
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            flag: --linux
+          - os: windows-latest
+            flag: --win
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend-dist
+
+      - name: Collect app files
+        run: |
+          mkdir -p desktop/resources/frontend desktop/resources/backend desktop/resources/bin
+          cp -r frontend-dist/. desktop/resources/frontend/
+          cp -r backend/app backend/sdk backend/requirements.txt desktop/resources/backend/
+          cp -r backend/board-indexes desktop/resources/backend/ || true
+
+      - name: Bundle Python 3.12 with the backend libraries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            TRIPLE=x86_64-pc-windows-msvc; PY=desktop/resources/python/python.exe
+          else
+            TRIPLE=x86_64-unknown-linux-gnu; PY=desktop/resources/python/bin/python3
+          fi
+          gh release download --repo astral-sh/python-build-standalone \
+            --pattern "cpython-3.12.*-${TRIPLE}-install_only.tar.gz" --dir pytmp
+          tar -xzf pytmp/*.tar.gz -C desktop/resources
+          "$PY" -m pip install --no-warn-script-location -r backend/requirements.txt
+
+      - name: Bundle arduino-cli
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            curl -fsSL -o cli.zip https://downloads.arduino.cc/arduino-cli/arduino-cli_latest_Windows_64bit.zip
+            7z x cli.zip -odesktop/resources/bin -y
+          else
+            curl -fsSL https://downloads.arduino.cc/arduino-cli/arduino-cli_latest_Linux_64bit.tar.gz \
+              | tar -xz -C desktop/resources/bin arduino-cli
+            chmod +x desktop/resources/bin/arduino-cli
+          fi
+
+      - name: Set version from the release tag (v1.2.3 -> 1.2.3)
+        if: github.event_name == 'release'
+        working-directory: desktop
+        run: npm version "${GITHUB_REF_NAME#v}" --no-git-tag-version --allow-same-version
+
+      - name: Build installers
+        working-directory: desktop
+        run: |
+          npm install
+          npx electron-builder ${{ matrix.flag }} --publish never
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: velxio-${{ matrix.os }}
+          path: |
+            desktop/dist/*.AppImage
+            desktop/dist/*.deb
+            desktop/dist/*.exe
+
+      - name: Attach to the GitHub Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            desktop/dist/*.AppImage
+            desktop/dist/*.deb
+            desktop/dist/*.exe
