@@ -13,6 +13,18 @@
 > SDA is wired to, so two identical sensors on `Wire` and `Wire1` are two devices and removing one
 > never evicts the other. The event constants, the ACK convention and the write-then-read sequence
 > below are unchanged. The model is in [board-buses.md](./board-buses.md).
+>
+> **Since 2026-09 (i2c-model-fidelity)**: the `MPU6050Slave` of section 7 is the one this
+> investigation ended with, kept here as the record of it. The one in the tree now behaves like the
+> chip where a driver can tell: it powers on asleep (`PWR_MGMT_1 = 0x40`), `DEVICE_RESET` restores
+> the power-on registers and is gone before the next read, the sample block `0x3B`-`0x48` is
+> worked out from the panel's values and the range the sketch selected (1 g at 8 g is 4096 counts,
+> so the gallery sketch prints 9.81 m/s² and not 39.23) and is latched when a read begins. It is the
+> twin of `VirtualMPU6050` in the tab, and both replay the same bus vectors,
+> `test/fixtures/i2c-vectors/mpu6050.json`. The worker seeds it from the sensor record, so the
+> first read shows the panel's values (24 °C, not 25). The per-event log line and the `i2c_trace`
+> message of "Debugging Infrastructure" are off unless the backend runs with
+> `VELXIO_I2C_TRACE=1`: they cost about 0.8 ms on every register read.
 
 ---
 

@@ -33,8 +33,23 @@ export interface I2CDevice {
   writeByte(value: number): boolean; // return true for ACK
   /** Called when master requests a byte from this device (read mode) */
   readByte(): number;
+  /**
+   * Optional: called on every START and repeated START that addresses the
+   * device, before the first byte of that phase; `read` is the direction bit.
+   * A chip that answers a burst from one sampling instant (the MPU-6050's
+   * sample block) latches it here. A host that cannot tell a model where a
+   * read begins does not call it, so such a model also latches on the first
+   * readByte that follows a writeByte or a stop.
+   */
+  start?(read: boolean): void;
   /** Optional: called on STOP condition */
   stop?(): void;
+  /**
+   * Optional: the MCU was reset (Stop/Run, the reset button, a reload). The
+   * chip kept its supply, so its registers are not touched; what belonged to
+   * the run that ended is, such as a note the monitor of that run was given.
+   */
+  boardReset?(): void;
   /**
    * Optional snapshot of the device's 256-byte register state. A host that
    * answers a guest from a copy of the part (the Raspberry Pi relay) uses it

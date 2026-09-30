@@ -51,7 +51,7 @@ node test/backend/e2e/test_mpu6050_simulation.mjs --timeout=60
 |------|--------|-----------------|-----------------|
 | `test_dht22_simulation.mjs` | DHT22 (GPIO4) | Temperature & humidity readings, `sensor_update` changes values | ~50 s |
 | `test_hcsr04_simulation.mjs` | HC-SR04 (GPIO18/19) | Distance at 10/40/100/200 cm, `sensor_update` changes distance | ~60 s |
-| `test_mpu6050_simulation.mjs` | MPU-6050 (I2C) | Accelerometer/gyroscope I2C readings | ~40 s |
+| `test_mpu6050_simulation.mjs` | MPU-6050 (I2C) | Every printed value is the one the sensor record carries, at the ranges the sketch selects; `sensor_update` changes one value and leaves the rest | ~40 s |
 
 ## Pass criteria
 
@@ -59,4 +59,4 @@ node test/backend/e2e/test_mpu6050_simulation.mjs --timeout=60
 |------|-------------|
 | DHT22 | First reading received + values change after `sensor_update` |
 | HC-SR04 | ≥3 correct readings, ≥2 distances, miss rate ≤30% |
-| MPU-6050 | I2C communication established, sensor data in serial output |
+| MPU-6050 | `begin()` succeeds, and acceleration, rotation and temperature read what the record and the update say (1 g is 9.81 m/s^2 at 8 g) |

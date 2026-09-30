@@ -15,6 +15,8 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { PartSimulationRegistry } from '../simulation/parts/PartSimulationRegistry';
 import { LineSensorHub } from '../simulation/line/LineSensorHub';
 import type { LineHostPort } from '../simulation/line/LineHost';
@@ -35,13 +37,14 @@ import { useSimulatorStore } from '../store/useSimulatorStore';
 import { busRegistry } from '../simulation/buses';
 import type {
   BoardPins,
+  BusDiagnostic,
   I2cControllerPort,
   I2cTransactionHandler,
   NetResolver,
   SpiControllerPort,
 } from '../simulation/buses';
 import { i2cPartWorkerPin } from '../simulation/parts/i2cPart';
-import '../simulation/parts/ProtocolParts';
+import { MPU6050_RULES, VirtualMPU6050 } from '../simulation/parts/ProtocolParts';
 
 // ─── Globals ──────────────────────────────────────────────────────────────────
 
@@ -233,6 +236,10 @@ interface I2cRig {
   readReg(addr: number, reg: number, n: number): number[] | null;
   /** Whether anything ACKs the address (an I2C scanner's probe). */
   ack(addr: number): boolean;
+  /** The wire itself, one call per START, byte and STOP. */
+  bus(): I2cTransactionHandler;
+  /** The MCU was reset (Stop/Run). */
+  reset(): void;
   dispose(): void;
 }
 
@@ -258,14 +265,20 @@ function i2cRig(wiring: Record<string, Record<string, RigPin>>): I2cRig {
     boardKind: () => 'arduino-uno',
     boards: () => [RIG_BOARD],
   };
+  let onReset: (() => void) | null = null;
   busRegistry.setResolver(resolver);
   busRegistry.bindEngine(RIG_BOARD, {
     pins: { onPinChange: () => () => {}, peekPinState: () => undefined },
     spi: [],
     i2c: [port],
+    setResetHandler: (h) => {
+      onReset = h;
+    },
   });
   const bus = () => handler!;
   return {
+    bus,
+    reset: () => onReset?.(),
     write(addr, bytes) {
       const acks = [bus().start(addr, false)];
       if (acks[0]) for (const b of bytes) acks.push(bus().write(b));
@@ -576,51 +589,78 @@ describe('ds1307 — I2C RTC', () => {
 
 // ─── mpu6050 ──────────────────────────────────────────────────────────────────
 
+const attachImu = (id = 'imu', props: Record<string, unknown> = {}) =>
+  PartSimulationRegistry.get('mpu6050')!.attachEvents!(
+    makeElement(props),
+    makeI2CSim() as any,
+    noPins,
+    id,
+  );
+
+/** PWR_MGMT_1 = 0x00. The chip powers on asleep, and a driver's first write is this one. */
+const wakeImu = (rig: I2cRig, addr = 0x68) => rig.write(addr, [0x6b, 0x00]);
+
 describe('mpu6050 — I2C IMU', () => {
   it('answers at 0x68 with AD0 low', () => {
     const rig = i2cRig({ imu: HW_I2C_PINS });
-    PartSimulationRegistry.get('mpu6050')!.attachEvents!(makeElement(), makeI2CSim() as any, noPins, 'imu');
+    attachImu();
     expect([rig.ack(0x68), rig.ack(0x69)]).toEqual([true, false]);
   });
 
   it('answers at 0x69 when element.ad0 is true', () => {
     const rig = i2cRig({ imu: HW_I2C_PINS });
-    PartSimulationRegistry.get('mpu6050')!.attachEvents!(
-      makeElement({ ad0: true }),
-      makeI2CSim() as any,
-      noPins,
-      'imu',
-    );
+    attachImu('imu', { ad0: true });
     expect([rig.ack(0x68), rig.ack(0x69)]).toEqual([false, true]);
   });
 
   it('WHO_AM_I register (0x75) returns 0x68', () => {
     const rig = i2cRig({ imu: HW_I2C_PINS });
-    PartSimulationRegistry.get('mpu6050')!.attachEvents!(makeElement(), makeI2CSim() as any, noPins, 'imu');
+    attachImu();
     expect(rig.readReg(0x68, 0x75, 1)).toEqual([0x68]);
   });
 
-  it('TEMP_OUT starts at the panel default (24 C), not the chip model power-on 25 C', () => {
+  it('powers on asleep: PWR_MGMT_1 reads 0x40 and the sample block reads zeros until SLEEP is cleared', () => {
     const rig = i2cRig({ imu: HW_I2C_PINS });
-    PartSimulationRegistry.get('mpu6050')!.attachEvents!(makeElement(), makeI2CSim() as any, noPins, 'imu');
+    attachImu();
+    expect(rig.readReg(0x68, 0x6b, 1)).toEqual([0x40]);
+    expect(rig.readReg(0x68, 0x3b, 14)).toEqual(new Array(14).fill(0));
+    wakeImu(rig);
+    expect(rig.readReg(0x68, 0x6b, 1)).toEqual([0x00]);
+    expect(rig.readReg(0x68, 0x3f, 2)).toEqual([0x40, 0x00]);
+  });
+
+  it('TEMP_OUT starts at the panel default (24 C), not at a value of the model', () => {
+    const rig = i2cRig({ imu: HW_I2C_PINS });
+    attachImu();
+    wakeImu(rig);
     expect(SENSOR_CONTROLS.mpu6050.defaultValues.temp).toBe(24);
     const [hi, lo] = rig.readReg(0x68, 0x41, 2)!;
-    const raw = ((hi << 8) | lo) << 16 >> 16;
+    const raw = (((hi << 8) | lo) << 16) >> 16;
     expect(raw / 340 + 36.53).toBeCloseTo(24, 2);
   });
 
-  it('ACCEL_ZOUT reports +1g (0x40, 0x00)', () => {
+  it('ACCEL_ZOUT reports +1g (0x40, 0x00) at the power-on range', () => {
     const rig = i2cRig({ imu: HW_I2C_PINS });
-    PartSimulationRegistry.get('mpu6050')!.attachEvents!(makeElement(), makeI2CSim() as any, noPins, 'imu');
+    attachImu();
+    wakeImu(rig);
     expect(rig.readReg(0x68, 0x3f, 2)).toEqual([0x40, 0x00]);
+  });
+
+  it('DEVICE_RESET is gone by the next read, so a driver that polls it moves on', () => {
+    // Adafruit_MPU6050::reset() waits for bit 7 of PWR_MGMT_1 with no timeout.
+    // The model used to store the byte as written, and begin() never returned.
+    const rig = i2cRig({ imu: HW_I2C_PINS });
+    attachImu();
+    rig.write(0x68, [0x6b, 0x80]);
+    expect(rig.readReg(0x68, 0x6b, 1)![0] & 0x80).toBe(0);
   });
 
   it('a repeated START for writing starts a new register pointer (no STOP in between)', () => {
     // M5Unified reads an IMU id twice with no STOP between the two reads: the
     // second pointer write must be taken as a pointer, not as data.
     const rig = i2cRig({ imu: HW_I2C_PINS });
-    PartSimulationRegistry.get('mpu6050')!.attachEvents!(makeElement(), makeI2CSim() as any, noPins, 'imu');
-    const h = (busRegistry.fabric(RIG_BOARD).i2cBuses.get(RIG_SDA)!);
+    attachImu();
+    const h = busRegistry.fabric(RIG_BOARD).i2cBuses.get(RIG_SDA)!;
     h.start(0x68, false);
     h.write(0x75);
     h.start(0x68, true);
@@ -633,29 +673,644 @@ describe('mpu6050 — I2C IMU', () => {
     expect(rig.readReg(0x68, 0x75, 1)).toEqual([0x68]);
   });
 
+  it('the panel reaches past the power-on range: 16 g and 2000 deg/s', () => {
+    const range = (key: string) => {
+      const c = SENSOR_CONTROLS.mpu6050.controls.find((x) => x.key === key);
+      return c?.type === 'slider' ? [c.min, c.max] : null;
+    };
+    for (const key of ['accelX', 'accelY', 'accelZ']) expect(range(key), key).toEqual([-16, 16]);
+    for (const key of ['gyroX', 'gyroY', 'gyroZ']) expect(range(key), key).toEqual([-2000, 2000]);
+    expect(SENSOR_CONTROLS.mpu6050.defaultValues).toEqual({
+      accelX: 0,
+      accelY: 0,
+      accelZ: 1,
+      gyroX: 0,
+      gyroY: 0,
+      gyroZ: 0,
+      temp: 24,
+    });
+  });
+
   it('cleanup takes it off the bus', () => {
     const rig = i2cRig({ imu: HW_I2C_PINS });
-    const cleanup = PartSimulationRegistry.get('mpu6050')!.attachEvents!(
-      makeElement(),
-      makeI2CSim() as any,
-      noPins,
-      'imu',
-    );
+    const cleanup = attachImu();
     cleanup();
     expect(rig.ack(0x68)).toBe(false);
   });
 
   it('two IMUs at 0x68: deleting one leaves the other answering', () => {
     const rig = i2cRig({ imuA: HW_I2C_PINS, imuB: HW_I2C_PINS });
-    const offA = PartSimulationRegistry.get('mpu6050')!.attachEvents!(
-      makeElement(),
-      makeI2CSim() as any,
-      noPins,
-      'imuA',
-    );
-    PartSimulationRegistry.get('mpu6050')!.attachEvents!(makeElement(), makeI2CSim() as any, noPins, 'imuB');
+    const offA = attachImu('imuA');
+    attachImu('imuB');
     offA();
     expect(rig.readReg(0x68, 0x75, 1)).toEqual([0x68]);
+  });
+});
+
+// ─── mpu6050: the bus vectors it shares with the backend twin ────────────────
+//
+// test/fixtures/i2c-vectors/mpu6050.json, format in the README next to it.
+// The Python twin replays the same file, so the two models cannot drift.
+
+interface VectorStep {
+  op: string;
+  data?: string;
+  reg?: string;
+  n?: number;
+  expect?: string;
+  rw?: string;
+  at?: string;
+  values?: Record<string, number>;
+}
+
+interface BusVector {
+  name: string;
+  spec: string;
+  driver?: string;
+  steps: VectorStep[];
+}
+
+interface BusVectorFile {
+  address: string;
+  rules: Record<string, unknown>;
+  inputs: Record<string, number>;
+  vectors: BusVector[];
+}
+
+const MPU_VECTORS: BusVectorFile = JSON.parse(
+  readFileSync(
+    fileURLToPath(new URL('../../../test/fixtures/i2c-vectors/mpu6050.json', import.meta.url)),
+    'utf8',
+  ),
+);
+const MPU_ADDR = parseInt(MPU_VECTORS.address, 16);
+
+/** "6B 00", "00*107 40": bytes in hex, XX*N repeats one. */
+function hexBytes(text: string): number[] {
+  const out: number[] = [];
+  for (const token of text.split(/\s+/).filter(Boolean)) {
+    const [byte, times] = token.split('*');
+    for (let i = times === undefined ? 1 : parseInt(times, 10); i > 0; i--)
+      out.push(parseInt(byte, 16));
+  }
+  return out;
+}
+
+const hexText = (bytes: readonly number[]): string =>
+  bytes.map((b) => b.toString(16).toUpperCase().padStart(2, '0')).join(' ');
+
+/** What replays a vector: the wire, the panel, and the copy a host would mirror. */
+interface VectorHost {
+  start(read: boolean): boolean;
+  write(byte: number): boolean;
+  read(): number;
+  stop(): void;
+  inputs(values: Record<string, number>): void;
+  dump(): Uint8Array;
+}
+
+/** The part on the rig's bus, as a board whose firmware runs in the tab reaches it. */
+function partHost(rig: I2cRig, id: string): VectorHost {
+  const bus = rig.bus();
+  return {
+    start: (read) => bus.start(MPU_ADDR, read),
+    write: (byte) => bus.write(byte),
+    read: () => bus.read(),
+    stop: () => bus.stop(),
+    inputs: (values) => dispatchSensorUpdate(id, values),
+    dump: () => {
+      const target = busRegistry
+        .fabric(RIG_BOARD)
+        .i2cBuses.get(RIG_SDA)!
+        .targetsAt(MPU_ADDR)[0].target;
+      return (target as { dumpRegisters?: () => Uint8Array }).dumpRegisters!();
+    },
+  };
+}
+
+/**
+ * The model alone, under a host that never says where a read begins: it
+ * clears the pointer flag on a START for writing and that is all it knows
+ * (the overlay's PartI2cTarget). The model then latches on the first byte
+ * read after a write or a STOP.
+ */
+function bareHost(dev: VirtualMPU6050): VectorHost {
+  return {
+    start: (read) => {
+      if (!read) dev.stop();
+      return true;
+    },
+    write: (byte) => dev.writeByte(byte),
+    read: () => dev.readByte(),
+    stop: () => dev.stop(),
+    inputs: (values) => dev.setInputs(values),
+    dump: () => dev.dumpRegisters(),
+  };
+}
+
+type BusFlavour = 'repeated-start' | 'stop-start';
+
+function replayVector(host: VectorHost, vector: BusVector, flavour: BusFlavour): void {
+  let open = false;
+  const start = (read: boolean) => {
+    // QEMU hands a device model a repeated START as FINISH and then START.
+    if (open && flavour === 'stop-start') host.stop();
+    open = true;
+    expect(host.start(read), 'the address is acknowledged').toBe(true);
+  };
+  const stop = () => {
+    open = false;
+    host.stop();
+  };
+  const send = (bytes: number[]) => {
+    for (const b of bytes) expect(host.write(b), `0x${b.toString(16)} is acknowledged`).toBe(true);
+  };
+  const recv = (n: number) => Array.from({ length: n }, () => host.read() & 0xff);
+
+  vector.steps.forEach((step, i) => {
+    let got: number[] | null = null;
+    switch (step.op) {
+      case 'write':
+        start(false);
+        send(hexBytes(step.data!));
+        stop();
+        break;
+      case 'read':
+        start(false);
+        send([parseInt(step.reg!, 16)]);
+        start(true);
+        got = recv(step.n!);
+        stop();
+        break;
+      case 'get':
+        start(true);
+        got = recv(step.n!);
+        stop();
+        break;
+      case 'start':
+        start(step.rw === 'r');
+        break;
+      case 'send':
+        send(hexBytes(step.data!));
+        break;
+      case 'recv':
+        got = recv(step.n!);
+        break;
+      case 'stop':
+        stop();
+        break;
+      case 'inputs':
+        host.inputs(step.values!);
+        break;
+      case 'dump': {
+        const at = parseInt(step.at!, 16);
+        got = Array.from(host.dump().slice(at, at + hexBytes(step.expect!).length));
+        break;
+      }
+      default:
+        throw new Error(`step ${i}: unknown op "${step.op}"`);
+    }
+    if (got)
+      expect(hexText(got), `step ${i} ${JSON.stringify(step)}`).toBe(
+        hexText(hexBytes(step.expect!)),
+      );
+  });
+}
+
+describe('mpu6050 — the rules table', () => {
+  it('is the table the shared vectors carry', () => {
+    const hex = (n: number) => hexText([n]);
+    const pairs = (o: Record<string, number>) =>
+      Object.fromEntries(Object.entries(o).map(([reg, v]) => [hex(Number(reg)), hex(v)]));
+    expect({
+      power_on: pairs(MPU6050_RULES.power_on),
+      read_only: MPU6050_RULES.read_only.map(([first, last]) => [hex(first), hex(last)]),
+      self_clearing: pairs(MPU6050_RULES.self_clearing),
+      accel_lsb_per_g: [...MPU6050_RULES.accel_lsb_per_g],
+      gyro_lsb_per_dps: [...MPU6050_RULES.gyro_lsb_per_dps],
+      temp_lsb_per_c: MPU6050_RULES.temp_lsb_per_c,
+      temp_offset_c: MPU6050_RULES.temp_offset_c,
+    }).toEqual(MPU_VECTORS.rules);
+  });
+
+  it('starts every vector from the values the panel starts from', () => {
+    expect(MPU_VECTORS.inputs).toEqual(SENSOR_CONTROLS.mpu6050.defaultValues);
+    expect(new VirtualMPU6050(MPU_ADDR).getInputs()).toEqual(MPU_VECTORS.inputs);
+  });
+});
+
+describe('mpu6050 — shared bus vectors', () => {
+  const flavours: BusFlavour[] = ['repeated-start', 'stop-start'];
+
+  describe.each(flavours)('the part on the bus fabric, %s', (flavour) => {
+    it.each(MPU_VECTORS.vectors.map((v) => [v.name, v] as const))('%s', (_name, vector) => {
+      const rig = i2cRig({ imu: HW_I2C_PINS });
+      attachImu();
+      const host = partHost(rig, 'imu');
+      host.inputs(MPU_VECTORS.inputs);
+      replayVector(host, vector, flavour);
+    });
+  });
+
+  describe.each(flavours)('the model under a host that does not announce START, %s', (flavour) => {
+    it.each(MPU_VECTORS.vectors.map((v) => [v.name, v] as const))('%s', (_name, vector) => {
+      const host = bareHost(new VirtualMPU6050(MPU_ADDR));
+      host.inputs(MPU_VECTORS.inputs);
+      replayVector(host, vector, flavour);
+    });
+  });
+});
+
+// ─── mpu6050: what four drivers put on the wire, and what they read back ─────
+//
+// Each driver below is its library's own code path, read from the source the
+// vector names, against the part. A field write is a read-modify-write in all
+// of them, so what they write depends on what the model answered: the traffic
+// is compared step by step with the vector of the same name, which is the
+// copy the Python twin replays.
+
+/** A driver's side of the wire. Every transaction is kept as a step of the vector format. */
+class DriverWire {
+  readonly steps: VectorStep[] = [];
+  private readonly host: VectorHost;
+
+  constructor(host: VectorHost) {
+    this.host = host;
+  }
+
+  /** beginTransmission, the bytes, endTransmission(): a STOP ends it. No bytes is a probe. */
+  write(...bytes: number[]): void {
+    expect(this.host.start(false)).toBe(true);
+    for (const b of bytes) expect(this.host.write(b)).toBe(true);
+    this.host.stop();
+    this.steps.push({ op: 'write', data: hexText(bytes) });
+  }
+
+  /** The pointer, a repeated START, n bytes: endTransmission(false) and requestFrom. */
+  read(reg: number, n: number): number[] {
+    expect(this.host.start(false)).toBe(true);
+    expect(this.host.write(reg)).toBe(true);
+    expect(this.host.start(true)).toBe(true);
+    const got = Array.from({ length: n }, () => this.host.read() & 0xff);
+    this.host.stop();
+    this.steps.push({ op: 'read', reg: hexText([reg]), n, expect: hexText(got) });
+    return got;
+  }
+
+  /** requestFrom on its own: n bytes from wherever the pointer is. */
+  get(n: number): number[] {
+    expect(this.host.start(true)).toBe(true);
+    const got = Array.from({ length: n }, () => this.host.read() & 0xff);
+    this.host.stop();
+    this.steps.push({ op: 'get', n, expect: hexText(got) });
+    return got;
+  }
+
+  /** Not the driver: the panel moves while the sketch runs. */
+  inputs(values: Record<string, number>): void {
+    this.host.inputs(values);
+    this.steps.push({ op: 'inputs', values });
+  }
+}
+
+const int16 = (hi: number, lo: number): number => (((hi << 8) | lo) << 16) >> 16;
+
+/** A field of a register that is written by reading the register and writing it back whole. */
+function registerField(wire: DriverWire, reg: number, width: number, shift: number) {
+  const mask = ((1 << width) - 1) << shift;
+  return {
+    read: (): number => (wire.read(reg, 1)[0] & mask) >> shift,
+    write: (value: number): void => {
+      const now = wire.read(reg, 1)[0];
+      wire.write(reg, (now & ~mask) | ((value << shift) & mask));
+    },
+  };
+}
+
+/** How many reads of a self-clearing bit a driver's wait loop makes before it moves on. */
+function pollUntilClear(bit: { read(): number }): number {
+  let reads = 1;
+  while (bit.read() === 1) {
+    if (++reads > 50) throw new Error('the reset bit never cleared: the driver hangs here');
+  }
+  return reads;
+}
+
+/**
+ * Adafruit_MPU6050 2.2.9 on Adafruit BusIO 1.17.4: Adafruit_MPU6050.cpp
+ * begin(), _init(), reset() and _read(), with Adafruit_I2CDevice.cpp and
+ * Adafruit_BusIO_Register.cpp for the transactions. The same library,
+ * compiled, is in mpu6050-real-firmware.test.ts.
+ */
+function adafruitArduino(wire: DriverWire) {
+  const accelRange = registerField(wire, 0x1c, 2, 3);
+  const gyroRange = registerField(wire, 0x1b, 2, 3);
+  const bandwidth = registerField(wire, 0x1a, 3, 0);
+  return {
+    /** How often reset() read DEVICE_RESET, or null when begin() says "not found". */
+    begin(): number | null {
+      wire.write(); // Adafruit_I2CDevice::detected()
+      if (wire.read(0x75, 1)[0] !== 0x68) return null;
+      const deviceReset = registerField(wire, 0x6b, 1, 7);
+      deviceReset.write(1);
+      const polls = pollUntilClear(deviceReset);
+      wire.write(0x68, 0x07); // sig_path_reset
+      wire.write(0x19, 0); // setSampleRateDivisor(0)
+      bandwidth.write(0); // MPU6050_BAND_260_HZ
+      gyroRange.write(1); // MPU6050_RANGE_500_DEG
+      accelRange.write(0); // MPU6050_RANGE_2_G
+      wire.write(0x6b, 0x01); // PLL on the X gyro, which is also what wakes the chip
+      return polls;
+    },
+    setAccelerometerRange: accelRange.write,
+    setGyroRange: gyroRange.write,
+    setFilterBandwidth: bandwidth.write,
+    /** getEvent(): m/s2, rad/s and deg C, with SENSORS_GRAVITY_STANDARD and SENSORS_DPS_TO_RADS. */
+    getEvent() {
+      const b = wire.read(0x3b, 14);
+      const accelScale = [16384, 8192, 4096, 2048][accelRange.read()];
+      const gyroScale = [131, 65.5, 32.8, 16.4][gyroRange.read()];
+      return {
+        acceleration: [0, 2, 4].map((i) => (int16(b[i], b[i + 1]) / accelScale) * 9.80665),
+        gyro: [8, 10, 12].map((i) => (int16(b[i], b[i + 1]) / gyroScale) * 0.017453293),
+        temperature: int16(b[6], b[7]) / 340 + 36.53,
+      };
+    },
+  };
+}
+
+/**
+ * CircuitPython adafruit_mpu6050 1.3.9 on adafruit_register 1.13.0 and
+ * adafruit_bus_device 5.2.17: __init__(), reset() and the three properties.
+ * An element of a StructArray is a transaction of its own, so one reading of
+ * the acceleration is three reads of two bytes.
+ */
+function adafruitCircuitPython(wire: DriverWire) {
+  const accelRange = registerField(wire, 0x1c, 2, 3);
+  const gyroRange = registerField(wire, 0x1b, 2, 3);
+  let accelScale = 0;
+  const pair = (reg: number) => {
+    const [hi, lo] = wire.read(reg, 2);
+    return int16(hi, lo);
+  };
+  return {
+    /** How often reset() read _reset. */
+    init(): number {
+      wire.write(); // the I2CDevice probe, writeto(address, b"")
+      if (wire.read(0x75, 1)[0] !== 0x68)
+        throw new Error('Failed to find MPU6050 - check your wiring!');
+      const reset = registerField(wire, 0x6b, 1, 7);
+      reset.write(1);
+      const polls = pollUntilClear(reset);
+      // _signal_path_reset is RWBits(3, 0x68, 3): the driver sets bits 5:3.
+      registerField(wire, 0x68, 3, 3).write(0b111);
+      // self._sample_rate_divisor = 0 names no register (the descriptor is
+      // sample_rate_divisor), so nothing goes out for it.
+      registerField(wire, 0x1a, 3, 0).write(0); // _filter_bandwidth = BAND_260_HZ
+      gyroRange.write(1); // RANGE_500_DPS
+      accelRange.write(0); // RANGE_2_G
+      accelScale = 1 / [16384, 8192, 4096, 2048][accelRange.read()];
+      registerField(wire, 0x6b, 3, 0).write(1); // clock_source = CLKSEL_INTERNAL_X
+      registerField(wire, 0x6b, 1, 6).write(0); // sleep = False
+      return polls;
+    },
+    acceleration: (): number[] => [0x3b, 0x3d, 0x3f].map((reg) => pair(reg) * accelScale * 9.80665),
+    gyro(): number[] {
+      const raw = [0x43, 0x45, 0x47].map(pair);
+      const scale = [131, 65.5, 32.8, 16.4][gyroRange.read()];
+      return raw.map((v) => ((v / scale) * Math.PI) / 180);
+    },
+    temperature: (): number => pair(0x41) / 340 + 36.53,
+  };
+}
+
+/**
+ * i2cdevlib MPU6050 on I2Cdev over Arduino Wire: MPU6050.cpp initialize() and
+ * getMotion6(), I2Cdev.cpp readBytes() and writeBits(). readBytes ends its
+ * pointer write with a STOP before it reads.
+ */
+function i2cdevlib(wire: DriverWire) {
+  const readBytes = (reg: number, n: number) => {
+    wire.write(reg);
+    return wire.get(n);
+  };
+  const writeBits = (reg: number, bitStart: number, length: number, data: number) => {
+    const shift = bitStart - length + 1;
+    const mask = ((1 << length) - 1) << shift;
+    const now = readBytes(reg, 1)[0];
+    wire.write(reg, (now & ~mask) | ((data << shift) & mask));
+  };
+  return {
+    initialize(): void {
+      writeBits(0x6b, 2, 3, 1); // setClockSource(MPU6050_CLOCK_PLL_XGYRO)
+      writeBits(0x1b, 4, 2, 0); // setFullScaleGyroRange(MPU6050_GYRO_FS_250)
+      writeBits(0x1c, 4, 2, 0); // setFullScaleAccelRange(MPU6050_ACCEL_FS_2)
+      writeBits(0x6b, 6, 1, 0); // setSleepEnabled(false)
+    },
+    /** Raw counts: ax, ay, az, gx, gy, gz. */
+    getMotion6(): number[] {
+      const b = readBytes(0x3b, 14);
+      return [0, 2, 4, 8, 10, 12].map((i) => int16(b[i], b[i + 1]));
+    },
+  };
+}
+
+/** rfetick/MPU6050_light: MPU6050_light.cpp begin() with its defaults, and fetchData(). */
+function mpu6050Light(wire: DriverWire) {
+  const fetchData = () => {
+    const b = wire.read(0x3b, 14);
+    return {
+      accZ: int16(b[4], b[5]) / 16384,
+      gyroX: int16(b[8], b[9]) / 65.5,
+      temp: (int16(b[6], b[7]) + 12412) / 340,
+    };
+  };
+  return {
+    begin(): void {
+      wire.write(0x6b, 0x01);
+      wire.write(0x19, 0x00);
+      wire.write(0x1a, 0x00);
+      wire.write(0x1b, 0x08); // setGyroConfig(1): 500 deg/s
+      wire.write(0x1c, 0x00); // setAccConfig(0): 2 g
+      fetchData(); // begin() ends with an update()
+    },
+    fetchData,
+  };
+}
+
+describe('mpu6050 — driver traces', () => {
+  /** The vector of a driver, with every byte list written out. */
+  const traceOf = (driver: string): VectorStep[] =>
+    MPU_VECTORS.vectors
+      .find((v) => v.driver === driver)!
+      .steps.map((step) => ({
+        ...step,
+        ...(step.data === undefined ? {} : { data: hexText(hexBytes(step.data)) }),
+        ...(step.expect === undefined ? {} : { expect: hexText(hexBytes(step.expect)) }),
+      }));
+
+  const onTheBus = (): DriverWire => {
+    const rig = i2cRig({ imu: HW_I2C_PINS });
+    attachImu();
+    return new DriverWire(partHost(rig, 'imu'));
+  };
+
+  it('Adafruit_MPU6050: begin() leaves its reset poll after one read; the gallery sketch reads 9.81 m/s2 and 1.745 rad/s', () => {
+    const wire = onTheBus();
+    const mpu = adafruitArduino(wire);
+    expect(mpu.begin()).toBe(1);
+    // The gallery example esp32-mpu6050 (data/examples.ts).
+    mpu.setAccelerometerRange(2); // MPU6050_RANGE_8_G
+    mpu.setGyroRange(1); // MPU6050_RANGE_500_DEG
+    mpu.setFilterBandwidth(4); // MPU6050_BAND_21_HZ
+
+    const atRest = mpu.getEvent();
+    expect(atRest.acceleration.map((v) => v.toFixed(2))).toEqual(['0.00', '0.00', '9.81']);
+    expect(atRest.gyro.map((v) => v.toFixed(3))).toEqual(['0.000', '0.000', '0.000']);
+    expect(atRest.temperature.toFixed(1)).toBe('24.0');
+
+    wire.inputs({ gyroX: 100 });
+    const turning = mpu.getEvent();
+    expect(turning.gyro[0].toFixed(3)).toBe('1.745');
+    expect(turning.acceleration[2].toFixed(2)).toBe('9.81');
+
+    expect(wire.steps).toEqual(traceOf('adafruit-mpu6050-arduino'));
+  });
+
+  it('CircuitPython adafruit_mpu6050: reset() leaves its poll after one read, and the chip ends up awake', () => {
+    const wire = onTheBus();
+    const mpu = adafruitCircuitPython(wire);
+    expect(mpu.init()).toBe(1);
+
+    wire.inputs({ gyroX: 100 });
+    expect(mpu.acceleration().map((v) => v.toFixed(2))).toEqual(['0.00', '0.00', '9.81']);
+    expect(mpu.gyro()[0].toFixed(3)).toBe('1.745');
+    expect(mpu.temperature().toFixed(1)).toBe('24.0');
+
+    expect(wire.steps).toEqual(traceOf('adafruit-mpu6050-circuitpython'));
+  });
+
+  it('i2cdevlib: initialize() finds the chip asleep, wakes it and reads 1 g and 100 deg/s at the power-on ranges', () => {
+    const wire = onTheBus();
+    const mpu = i2cdevlib(wire);
+    mpu.initialize();
+    wire.inputs({ gyroX: 100 });
+    expect(mpu.getMotion6()).toEqual([0, 0, 16384, 13100, 0, 0]);
+    expect(wire.steps).toEqual(traceOf('i2cdevlib'));
+  });
+
+  it('MPU6050_light: the gyro reads in its 500 deg/s range, 65.5 counts per deg/s', () => {
+    const wire = onTheBus();
+    const mpu = mpu6050Light(wire);
+    mpu.begin();
+    wire.inputs({ gyroX: 100 });
+    const data = mpu.fetchData();
+    expect(data.gyroX).toBeCloseTo(100, 6);
+    expect(data.accZ).toBeCloseTo(1, 6);
+    // The library's own offset (12412 / 340) is not the datasheet's 36.53.
+    expect(data.temp).toBeCloseTo(24, 1);
+    expect(wire.steps).toEqual(traceOf('mpu6050-light'));
+  });
+});
+
+// ─── mpu6050: reading it asleep says so, once per run ────────────────────────
+
+describe('mpu6050 — read while asleep', () => {
+  const NOTE = 'MPU6050 0x68 is in sleep mode: write 0x00 to PWR_MGMT_1 (0x6B) to wake it';
+
+  const listeners: Array<() => void> = [];
+  afterEach(() => {
+    for (const off of listeners.splice(0)) off();
+  });
+
+  function listen(): BusDiagnostic[] {
+    const heard: BusDiagnostic[] = [];
+    listeners.push(
+      busRegistry.onDiagnostic((d) => {
+        if (d.code === 'i2c-target-asleep') heard.push(d);
+      }),
+    );
+    return heard;
+  }
+
+  it('the first read of the sample block tells the monitor of its board, and only the first', () => {
+    const rig = i2cRig({ imu: HW_I2C_PINS });
+    attachImu();
+    const heard = listen();
+    rig.readReg(0x68, 0x3b, 14);
+    expect(heard).toEqual([
+      { code: 'i2c-target-asleep', bus: 'i2c', boardId: RIG_BOARD, owners: ['imu'], message: NOTE },
+    ]);
+    rig.readReg(0x68, 0x3b, 14);
+    rig.readReg(0x68, 0x43, 6);
+    expect(heard).toHaveLength(1);
+  });
+
+  it('the identity, the power state and the configuration can be read in silence', () => {
+    const rig = i2cRig({ imu: HW_I2C_PINS });
+    attachImu();
+    const heard = listen();
+    rig.readReg(0x68, 0x75, 1);
+    rig.readReg(0x68, 0x6b, 1);
+    rig.readReg(0x68, 0x19, 4);
+    rig.ack(0x68);
+    expect(heard).toEqual([]);
+  });
+
+  it('a sketch that wakes the chip first never hears it', () => {
+    const rig = i2cRig({ imu: HW_I2C_PINS });
+    attachImu();
+    const heard = listen();
+    wakeImu(rig);
+    rig.readReg(0x68, 0x3b, 14);
+    expect(heard).toEqual([]);
+  });
+
+  it('names the address the chip answers at', () => {
+    const rig = i2cRig({ imu: HW_I2C_PINS });
+    attachImu('imu', { ad0: true });
+    const heard = listen();
+    rig.readReg(0x69, 0x3b, 2);
+    expect(heard.map((d) => d.message)).toEqual([NOTE.replace('0x68', '0x69')]);
+  });
+
+  it('the next run is told again: an MCU reset leaves the chip powered, and asleep', () => {
+    const rig = i2cRig({ imu: HW_I2C_PINS });
+    attachImu();
+    const heard = listen();
+    rig.readReg(0x68, 0x3b, 14);
+    rig.reset();
+    expect(rig.readReg(0x68, 0x6b, 1), 'the MCU reset is not a power cycle').toEqual([0x40]);
+    rig.readReg(0x68, 0x3b, 14);
+    rig.readReg(0x68, 0x3b, 14);
+    expect(heard).toHaveLength(2);
+  });
+
+  it('a copy taken for a host that mirrors the registers is not a read', () => {
+    const rig = i2cRig({ imu: HW_I2C_PINS });
+    attachImu();
+    const heard = listen();
+    partHost(rig, 'imu').dump();
+    expect(heard).toEqual([]);
+  });
+
+  it('a chip on no bus has nobody to tell', () => {
+    i2cRig({});
+    attachImu('loose');
+    const heard = listen();
+    busRegistry.reportI2cTarget('loose', 'i2c-target-asleep', NOTE);
+    busRegistry.reportI2cTarget('nobody', 'i2c-target-asleep', NOTE);
+    expect(heard).toEqual([]);
+  });
+
+  it('two chips asleep on one bus are two notes', () => {
+    const rig = i2cRig({ imuA: HW_I2C_PINS, imuB: HW_I2C_PINS });
+    attachImu('imuA');
+    attachImu('imuB', { ad0: true });
+    const heard = listen();
+    rig.readReg(0x68, 0x3b, 2);
+    rig.readReg(0x69, 0x3b, 2);
+    expect(heard.map((d) => d.owners)).toEqual([['imuA'], ['imuB']]);
   });
 });
 
@@ -1331,6 +1986,128 @@ describe('ds1307 — ESP32 path', () => {
     );
     cleanup();
     expect(sim.unregisterSensor).toHaveBeenCalledWith(i2cPartWorkerPin('rtc-q3'));
+  });
+});
+
+// ─── mpu6050 — ESP32 path ─────────────────────────────────────────────────────
+
+describe('mpu6050 — ESP32 path', () => {
+  it('registers a worker record at its address that starts from the panel values', () => {
+    // The worker builds its own copy of the chip. Without the values in the
+    // record it started from defaults of its own (the die at 25 C against the
+    // panel's 24) until the first slider moved.
+    const sim = makeEsp32Sim();
+    PartSimulationRegistry.get('mpu6050')!.attachEvents!(
+      makeElement(),
+      sim as any,
+      noPins,
+      'imu-q1',
+    );
+    expect(sim.registerSensor).toHaveBeenCalledWith('mpu6050', i2cPartWorkerPin('imu-q1'), {
+      accelX: 0,
+      accelY: 0,
+      accelZ: 1,
+      gyroX: 0,
+      gyroY: 0,
+      gyroZ: 0,
+      temp: 24,
+      addr: 0x68,
+      owner: 'imu-q1',
+    });
+  });
+
+  it('carries address 0x69 when AD0 is high', () => {
+    const sim = makeEsp32Sim();
+    PartSimulationRegistry.get('mpu6050')!.attachEvents!(
+      makeElement({ ad0: true }),
+      sim as any,
+      noPins,
+      'imu-q2',
+    );
+    expect(sim.registerSensor).toHaveBeenCalledWith(
+      'mpu6050',
+      i2cPartWorkerPin('imu-q2'),
+      expect.objectContaining({ addr: 0x69 }),
+    );
+  });
+
+  it('a slider that moves reaches the worker under the same names', () => {
+    const sim = makeEsp32Sim();
+    PartSimulationRegistry.get('mpu6050')!.attachEvents!(
+      makeElement(),
+      sim as any,
+      noPins,
+      'imu-q3',
+    );
+    dispatchSensorUpdate('imu-q3', { gyroX: 100 });
+    expect(sim.updateSensor).toHaveBeenCalledWith(i2cPartWorkerPin('imu-q3'), { gyroX: 100 });
+  });
+});
+
+// ─── bmp280 — its address ─────────────────────────────────────────────────────
+
+describe('bmp280 — the address SDO selects', () => {
+  const CHIP_ID = 0xd0;
+  const attachBmp = (props: Record<string, unknown> = {}) =>
+    PartSimulationRegistry.get('bmp280')!.attachEvents!(
+      makeElement(props),
+      makeI2CSim() as any,
+      noPins,
+      'bmp',
+    );
+
+  it('answers at 0x76 when nothing says otherwise', () => {
+    const rig = i2cRig({ bmp: HW_I2C_PINS });
+    attachBmp();
+    expect([rig.ack(0x76), rig.ack(0x77)]).toEqual([true, false]);
+  });
+
+  it('answers at 0x77 when element.address says so', () => {
+    const rig = i2cRig({ bmp: HW_I2C_PINS });
+    attachBmp({ address: '0x77' });
+    expect([rig.ack(0x76), rig.ack(0x77)]).toEqual([false, true]);
+  });
+
+  it('answers at 0x77 when element.i2cAddress says so, which is what the Grove BMP280 sets', () => {
+    // Seeed_BMP280 has 0x77 compiled in and, after requestFrom, waits in
+    // while (!Wire.available()) for a byte that a NAK never brings: with the
+    // model at 0x76 the gallery example grove-bmp280-xiao-esp32c6 printed
+    // nothing after its boot banner.
+    const rig = i2cRig({ bmp: HW_I2C_PINS });
+    attachBmp({ i2cAddress: '0x77' });
+    expect([rig.ack(0x76), rig.ack(0x77)]).toEqual([false, true]);
+    expect(rig.readReg(0x77, CHIP_ID, 1)).toEqual([0x58]);
+  });
+
+  it('takes the address as a number or in decimal too', () => {
+    for (const i2cAddress of [0x77, '119', '0X77']) {
+      const rig = i2cRig({ bmp: HW_I2C_PINS });
+      const off = attachBmp({ i2cAddress });
+      expect([rig.ack(0x76), rig.ack(0x77)], String(i2cAddress)).toEqual([false, true]);
+      off();
+      rig.dispose();
+    }
+  });
+
+  it('stays at 0x76 for an address the chip does not have', () => {
+    const rig = i2cRig({ bmp: HW_I2C_PINS });
+    attachBmp({ i2cAddress: '0x3C' });
+    expect([rig.ack(0x3c), rig.ack(0x76), rig.ack(0x77)]).toEqual([false, true, false]);
+  });
+
+  it('the worker record of a QEMU board carries the same address', () => {
+    const sim = makeEsp32Sim();
+    PartSimulationRegistry.get('bmp280')!.attachEvents!(
+      makeElement({ i2cAddress: '0x77' }),
+      sim as any,
+      noPins,
+      'bmp-grove',
+    );
+    expect(sim.registerSensor).toHaveBeenCalledWith(
+      'bmp280',
+      i2cPartWorkerPin('bmp-grove'),
+      expect.objectContaining({ addr: 0x77 }),
+    );
   });
 });
 

@@ -371,6 +371,7 @@ person wiring the circuit. The full list (`BusDiagnosticCode` in `types.ts`):
 | `spi-no-controller` | declared in the code type, never emitted: a bus whose pins no controller is routed to is served by the software decoder and stays silent | |
 | `i2c-address-conflict` | two targets answer at one address on one bus | every one ACKs and a read is the wired-AND; change an address or move one to another bus |
 | `i2c-wiring` | SDA and SCL crossed against a controller; a target whose SCL is not the bus's clock; one line on a board and the other not; SDA on one board and SCL on another | which line goes where; wire both to the board's I2C pins or to two GPIOs for software I2C |
+| `i2c-target-asleep` | a chip that powers on asleep was read for data before the sketch woke it (the MPU-6050's sample block with SLEEP set) | the chip answers zeros, as on the bench, and which register to write to wake it |
 | `uart-baud-mismatch` | receiver and sender rates or frames differ beyond 3 % | what each side runs at, and that what arrives is garbage, as on hardware |
 | `uart-tx-contention` | two transmitters on one wire (a module's TX on the board's TX pin, two modules on one RX, two boards' TX wired together) | who transmits, and which pin to move to |
 | `uart-wiring` | RX wired to RX (nobody transmits), or two controllers routed to one TX pin | wire the module's RX to the board's TX pin |
@@ -384,6 +385,11 @@ Rules:
   once per message. The registry forgets them on `resetDiagnostics()`. The
   suites call it between cases; the app does not call it on Run today, so in
   a page each one is said once.
+- The exception is what a chip says about its own state
+  (`i2c-target-asleep`). The chip raises it through its part's handle
+  (`I2cPartHandle.report`, `busRegistry.reportI2cTarget`) when it is due,
+  once per power-on and per MCU reset, and the registry passes it on as it
+  comes: a second Run hears it again.
 - They reach the user through the simulator notes of the board's monitor
   (`appendSimulatorNote` in `useSimulatorStore.ts`, wired to
   `busRegistry.onDiagnostic`). The part inspector does not show them yet.
@@ -698,7 +704,8 @@ does not say it may refuse them, and asks the tab only for the ones that do
 
 Most parts do not implement `I2cTarget` by hand: `attachI2cPart`
 (`parts/i2cPart.ts`) adapts the register-file `I2CDevice` shape the parts
-already have (`writeByte`, `readByte`, `stop`) and, on a QEMU board, also
+already have (`writeByte`, `readByte`, `stop`, and the optional `start` and
+`boardReset`) and, on a QEMU board, also
 files the worker record the guest is answered from. The
 [part author guide](./board-buses-part-authoring.md#an-i2c-target) shows it.
 

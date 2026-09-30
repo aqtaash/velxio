@@ -609,6 +609,7 @@ export type BusDiagnosticCode =
   | 'spi-cross-board'
   | 'i2c-address-conflict'
   | 'i2c-wiring'
+  | 'i2c-target-asleep'
   | 'uart-baud-mismatch'
   | 'uart-tx-contention'
   | 'uart-wiring'

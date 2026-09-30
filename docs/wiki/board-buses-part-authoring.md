@@ -303,8 +303,15 @@ PartSimulationRegistry.register('mpu6050', {
     const el = element as any;
     const addr = el.ad0 === true || el.ad0 === 'true' ? 0x69 : 0x68;
     const device = new VirtualMPU6050(addr);
-    const part = attachI2cPart({ simulator, componentId, device, worker: { type: 'mpu6050' } });
-    // ...live values into device.registers, and part.updateWorker(values) for the worker's copy
+    device.setInputs(getSensorControl('mpu6050')?.defaultValues ?? {});
+    const part = attachI2cPart({
+      simulator,
+      componentId,
+      device,
+      worker: { type: 'mpu6050', props: { ...device.getInputs() } },
+    });
+    device.onAsleepRead = () => part.report('i2c-target-asleep', '...');
+    // ...live values into device.setInputs(values), and part.updateWorker(values) for the worker's copy
     return () => {
       // ...
       part.dispose();
@@ -322,13 +329,30 @@ What `attachI2cPart` does with it:
   `writeByte` / `readByte` / `stop`, and clears the "waiting for a pointer"
   flag on a repeated START for writing (M5Unified reads the BMI270's id that
   way) as well as on STOP;
+- a model that defines `start(read)` hears every START and repeated START
+  before its first byte, and one that defines `boardReset()` hears the MCU
+  reset. The MPU-6050 latches its sample block at the START of a read, so a
+  burst is one sample. Both are optional, and a host that cannot say where a
+  read begins does not call `start`: a model that latches must also do it on
+  the first `readByte` after a `writeByte` or a `stop`;
 - on a board whose guest runs in a worker, sends
-  `registerSensor(type, chipVirtualPin(componentId), { addr, owner })` so the
-  worker's own copy answers the guest, and `updateWorker(values)` keeps that
-  copy fed. The worker only has models for the types in `WORKER_I2C_MODELS`
+  `registerSensor(type, chipVirtualPin(componentId), { ...props, addr, owner })`
+  so the worker's own copy answers the guest, starting from the values in
+  `props`, and `updateWorker(values)` keeps that copy fed. The worker only
+  has models for the types in `WORKER_I2C_MODELS`
   (`buses/workerI2cModels.ts`); a part of another type is reported on a
   remote bus (`bus-remote-responder-missing`), not silently absent;
+- `report(code, message)` puts a note about the part's own state in the
+  monitor of the board whose bus it is on. The part decides when it is due;
 - `dispose()` takes the target off by identity and the worker record with it.
+
+A model stores what the guest wrote and what the panel set as two things. The
+panel's values are the world around the chip: they survive the chip's own
+soft reset, and the output registers are worked out from them and from the
+configuration the guest selected when they are read. A bit that triggers
+something (a reset, a one-shot conversion) is never stored, so a driver that
+polls it reads 0 at once. `test/fixtures/i2c-vectors` holds the bus vectors a
+model and its backend twin both replay.
 
 A write sink (a display, an expander) uses the same call with
 `worker: { type: 'ssd1306', echo: (data) => ... }`: the worker ACKs and

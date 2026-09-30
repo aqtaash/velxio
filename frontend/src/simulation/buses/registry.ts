@@ -28,6 +28,7 @@ import type { I2cBus, I2cMember } from './i2cBus';
 import { hasRemoteModel, type SpiBus, type SpiMember } from './spiBus';
 import type {
   BusDiagnostic,
+  BusDiagnosticCode,
   BusHandle,
   DevicePin,
   EngineBinding,
@@ -1065,10 +1066,29 @@ export class BusRegistry {
     this.seenDiag.clear();
   }
 
+  /**
+   * What an I2C chip has to say about its own state, to the monitor of the
+   * board whose bus it is on: an MPU-6050 read while it still sleeps. It goes
+   * to the listeners every bus diagnostic goes to. The chip says it when it
+   * is due (once per power-on and per MCU reset), so it is not held back as
+   * already said: that filter is for what the registry works out again on
+   * every change of the circuit, and a second Run has to hear this again.
+   * A chip on no bus is read by nobody and has nothing to report.
+   */
+  reportI2cTarget(owner: string, code: BusDiagnosticCode, message: string): void {
+    const placed = this.i2c.get(owner)?.placements[0];
+    if (!placed) return;
+    this.tell({ code, bus: 'i2c', boardId: placed.bus.boardId, owners: [owner], message });
+  }
+
   private emit(d: BusDiagnostic): void {
     const key = `${d.code}|${d.boardId ?? ''}|${d.owners.join(',')}|${d.owners.length ? '' : d.message}`;
     if (this.seenDiag.has(key)) return;
     this.seenDiag.add(key);
+    this.tell(d);
+  }
+
+  private tell(d: BusDiagnostic): void {
     for (const l of this.diagListeners) {
       try {
         l(d);

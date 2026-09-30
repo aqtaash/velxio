@@ -499,79 +499,272 @@ PartSimulationRegistry.register('ds1307', {
 // ─── MPU-6050 IMU ────────────────────────────────────────────────────────────
 
 /**
- * Virtual MPU-6050 — 6-axis IMU register simulation at I2C address 0x68.
- *
- * Pre-loaded registers:
- *  0x75 WHO_AM_I = 0x68
- *  0x6B PWR_MGMT_1 = 0x00  (already awake — no need to write 0 to wake)
- *  0x3B–0x40 ACCEL XYZ = (0, 0, +1g = 0x4000) — device sitting flat
- *  0x41–0x42 TEMP_OUT   = ~25°C
- *  0x43–0x48 GYRO XYZ  = 0 (stationary)
- *
- * The sketch can write to set register pointer, then read sequentially.
+ * What the MPU-6050 does with a byte written to it, and how it turns motion
+ * into counts, as one table. The model below works from it, the tests hold it
+ * against the copy in test/fixtures/i2c-vectors/mpu6050.json, and the backend
+ * twin (esp32_i2c_slaves.MPU6050Slave) follows the same facts. Sections are
+ * those of the register map, RM-MPU-6000A-00 rev 4.2.
  */
-class VirtualMPU6050 implements I2CDevice {
+export const MPU6050_RULES = {
+  /** Every register powers on at 0x00 but these: asleep, and its id (section 3). */
+  power_on: { 0x6b: 0x40, 0x75: 0x68 },
+  /**
+   * Inclusive ranges a write leaves as they are: I2C_MST_STATUS, INT_STATUS,
+   * the sample block with the external sensor data behind it, FIFO_COUNT
+   * and WHO_AM_I (sections 4.13, 4.16 to 4.20, 4.30 and 4.32).
+   */
+  read_only: [
+    [0x36, 0x36],
+    [0x3a, 0x3a],
+    [0x3b, 0x60],
+    [0x72, 0x73],
+    [0x75, 0x75],
+  ],
+  /**
+   * Bits that start something and are never stored, so the next read finds
+   * them at 0. All of SIGNAL_PATH_RESET, which is write-only (4.26). The
+   * resets of USER_CTRL (4.27) and its bit 3, where i2cdevlib and InvenSense's
+   * own driver reset the DMP; i2cdevlib sets one bit at a time with a
+   * read-modify-write, so a bit that stuck would fire again on every later
+   * write. DEVICE_RESET in PWR_MGMT_1 (4.28).
+   */
+  self_clearing: { 0x68: 0xff, 0x6a: 0x0f, 0x6b: 0x80 },
+  /**
+   * Counts per g by AFS_SEL (4.17) and per degree per second by FS_SEL
+   * (4.19). The table and not 131 / 2^n, which gives 32.75 and 16.375: the
+   * drivers divide by 32.8 and 16.4.
+   */
+  accel_lsb_per_g: [16384, 8192, 4096, 2048],
+  gyro_lsb_per_dps: [131, 65.5, 32.8, 16.4],
+  /** TEMP_OUT = (T - 36.53) * 340 (4.18). */
+  temp_lsb_per_c: 340,
+  temp_offset_c: 36.53,
+} as const;
+
+/** Motion and temperature at the chip, under the names of the panel's sliders. */
+export interface Mpu6050Inputs {
+  /** g */
+  accelX: number;
+  accelY: number;
+  accelZ: number;
+  /** degrees per second */
+  gyroX: number;
+  gyroY: number;
+  gyroZ: number;
+  /** degrees Celsius */
+  temp: number;
+}
+
+const MPU6050_INPUT_KEYS = [
+  'accelX',
+  'accelY',
+  'accelZ',
+  'gyroX',
+  'gyroY',
+  'gyroZ',
+  'temp',
+] as const;
+
+const MPU_GYRO_CONFIG = 0x1b;
+const MPU_ACCEL_CONFIG = 0x1c;
+/** ACCEL_XOUT_H to GYRO_ZOUT_L: three axes, the die temperature, three axes. */
+const MPU_SAMPLE_FIRST = 0x3b;
+const MPU_SAMPLE_LAST = 0x48;
+const MPU_USER_CTRL = 0x6a;
+const MPU_SIG_COND_RESET = 0x01;
+const MPU_PWR_MGMT_1 = 0x6b;
+const MPU_DEVICE_RESET = 0x80;
+const MPU_SLEEP = 0x40;
+
+const MPU_READ_ONLY = new Uint8Array(256);
+for (const [first, last] of MPU6050_RULES.read_only) MPU_READ_ONLY.fill(1, first, last + 1);
+const MPU_SELF_CLEARING = new Uint8Array(256);
+for (const [reg, mask] of Object.entries(MPU6050_RULES.self_clearing)) {
+  MPU_SELF_CLEARING[Number(reg)] = mask;
+}
+
+/**
+ * A physical value as the counts of a 16-bit output register. Half a count
+ * rounds away from zero, so a tilt one way and the same tilt the other way
+ * read the same size (Math.round sends -65.5 to -65), and what does not fit
+ * stays at the end of the scale, as the converter's output does.
+ */
+function mpuCounts(value: number): number {
+  const counts = Math.sign(value) * Math.round(Math.abs(value));
+  return Math.max(-32768, Math.min(32767, counts));
+}
+
+/**
+ * Virtual MPU-6050: the 6-axis IMU, modelled where a driver can tell the
+ * difference from the chip.
+ *
+ *  - It powers on asleep (PWR_MGMT_1 = 0x40), so a sketch that reads without
+ *    waking it reads zeros, as it does on the bench.
+ *  - DEVICE_RESET puts every register back to its power-on value and is gone
+ *    before the next read. Adafruit_MPU6050::reset() polls that bit with no
+ *    timeout: while it was stored like any other byte, begin() never returned.
+ *  - What the panel sets is the world around the chip, not a register: it
+ *    survives a reset, and the sample block 0x3B-0x48 is worked out from it
+ *    and from the full-scale ranges the sketch selected, when a read begins.
+ *    The whole burst is answered from that one sample (4.17), so a slider
+ *    moving while it is read cannot mix two instants.
+ *  - Asleep, the block holds what it held when the chip fell asleep.
+ */
+export class VirtualMPU6050 implements I2CDevice {
   address: number;
-  registers = new Uint8Array(256);
+  /** The sample block was read while the chip sleeps, for the first time in this run. */
+  onAsleepRead: (() => void) | null = null;
+
+  private readonly regs = new Uint8Array(256);
+  private readonly inputs: Mpu6050Inputs = {
+    accelX: 0,
+    accelY: 0,
+    accelZ: 1,
+    gyroX: 0,
+    gyroY: 0,
+    gyroZ: 0,
+    temp: 24,
+  };
+  /** The sample the read in progress is answered from. */
+  private readonly sample = new Uint8Array(MPU_SAMPLE_LAST - MPU_SAMPLE_FIRST + 1);
+  /** What the block held when SLEEP was set; zeros after power-on and reset. */
+  private readonly lastAwake = new Uint8Array(MPU_SAMPLE_LAST - MPU_SAMPLE_FIRST + 1);
+  /** No START was heard for the read that comes next: latch on its first byte. */
+  private latchDue = true;
+  private asleepReadSaid = false;
   private regPtr = 0;
   private firstByte = true;
 
   constructor(address: number) {
     this.address = address;
+    this.powerOn();
+  }
 
-    // WHO_AM_I
-    this.registers[0x75] = 0x68;
-    // PWR_MGMT_1: device awake by default (0 = no sleep)
-    this.registers[0x6b] = 0x00;
+  /** The panel moved. Only the values it names change. */
+  setInputs(values: Record<string, unknown>): void {
+    for (const key of MPU6050_INPUT_KEYS) {
+      const v = values[key];
+      if (typeof v === 'number' && Number.isFinite(v)) this.inputs[key] = v;
+    }
+  }
 
-    // ACCEL: Z = +1g = +16384 (0x4000) at ±2g full-scale
-    this.registers[0x3b] = 0x00; // ACCEL_XOUT_H
-    this.registers[0x3c] = 0x00; // ACCEL_XOUT_L
-    this.registers[0x3d] = 0x00; // ACCEL_YOUT_H
-    this.registers[0x3e] = 0x00; // ACCEL_YOUT_L
-    this.registers[0x3f] = 0x40; // ACCEL_ZOUT_H (0x4000 = +16384 = +1g)
-    this.registers[0x40] = 0x00; // ACCEL_ZOUT_L
+  getInputs(): Mpu6050Inputs {
+    return { ...this.inputs };
+  }
 
-    // TEMP: T(°C) = TEMP_OUT / 340.0 + 36.53
-    //  → TEMP_OUT = (25 - 36.53) × 340 ≈ -3920 = 0xF190
-    const tempRaw = Math.round((25 - 36.53) * 340) & 0xffff;
-    this.registers[0x41] = (tempRaw >> 8) & 0xff;
-    this.registers[0x42] = tempRaw & 0xff;
-
-    // GYRO: all zero (stationary)
-    // 0x43–0x48 already 0 from Uint8Array initialization
+  start(read: boolean): void {
+    if (read) this.latch();
   }
 
   writeByte(value: number): boolean {
+    // For a host that does not say where a read begins: after a write, the
+    // next byte read is the first of a new read.
+    this.latchDue = true;
     if (this.firstByte) {
-      this.regPtr = value;
+      this.regPtr = value & 0xff;
       this.firstByte = false;
-    } else {
-      this.registers[this.regPtr] = value;
-      this.regPtr = (this.regPtr + 1) & 0xff;
+      return true;
     }
+    const reg = this.regPtr;
+    this.regPtr = (reg + 1) & 0xff;
+    this.writeRegister(reg, value & 0xff);
     return true;
   }
 
   readByte(): number {
-    const val = this.registers[this.regPtr];
-    this.regPtr = (this.regPtr + 1) & 0xff;
-    return val;
-  }
-
-  stop(): void {
-    this.firstByte = true;
+    if (this.latchDue) this.latch();
+    const reg = this.regPtr;
+    this.regPtr = (reg + 1) & 0xff;
+    if (reg < MPU_SAMPLE_FIRST || reg > MPU_SAMPLE_LAST) return this.regs[reg];
+    if (this.asleep && !this.asleepReadSaid) {
+      this.asleepReadSaid = true;
+      this.onAsleepRead?.();
+    }
+    return this.sample[reg - MPU_SAMPLE_FIRST];
   }
 
   /**
-   * The 256 registers as they stand. The MPU-6050 is a plain register file
-   * (pointer write, auto-incrementing reads, no clear-on-read), so a copy
-   * answers reads exactly like the chip: a board whose firmware runs
-   * elsewhere (the ESP32 QEMU proxy, the Raspberry Pi guest's bus relay)
-   * reads it from that copy instead of a round trip per transaction.
+   * The pointer survives the STOP: i2cdevlib writes it in one transaction and
+   * reads in the next, and QEMU ends every write phase this way.
+   */
+  stop(): void {
+    this.firstByte = true;
+    this.latchDue = true;
+  }
+
+  /** A new run reads a chip that is still asleep: its monitor is told as well. */
+  boardReset(): void {
+    this.asleepReadSaid = false;
+  }
+
+  /**
+   * The registers as a read would find them now: the sample block encoded
+   * from the panel's values (or what a sleeping chip holds), and no trigger
+   * bit. A host that answers its guest from a copy (the Raspberry Pi relay)
+   * mirrors this.
    */
   dumpRegisters(): Uint8Array {
-    return this.registers.slice();
+    const out = this.regs.slice();
+    out.set(this.asleep ? this.lastAwake : this.encode(), MPU_SAMPLE_FIRST);
+    return out;
+  }
+
+  private get asleep(): boolean {
+    return (this.regs[MPU_PWR_MGMT_1] & MPU_SLEEP) !== 0;
+  }
+
+  private powerOn(): void {
+    this.regs.fill(0);
+    for (const [reg, value] of Object.entries(MPU6050_RULES.power_on)) {
+      this.regs[Number(reg)] = value;
+    }
+    this.lastAwake.fill(0);
+  }
+
+  private writeRegister(reg: number, value: number): void {
+    if (MPU_READ_ONLY[reg]) return;
+    if (reg === MPU_PWR_MGMT_1 && (value & MPU_DEVICE_RESET) !== 0) {
+      // Nothing of the byte is kept, SLEEP and CLKSEL included: Adafruit's
+      // read-modify-write sends 0xC0 and then has to read 0x40.
+      this.powerOn();
+      return;
+    }
+    // SIG_COND_RESET clears the sensor registers too (4.27), which shows on a
+    // sleeping chip; one that is awake has a new sample by the next read.
+    if (reg === MPU_USER_CTRL && (value & MPU_SIG_COND_RESET) !== 0) this.lastAwake.fill(0);
+    const stored = value & ~MPU_SELF_CLEARING[reg] & 0xff;
+    // The chip sampled until now, so what it holds asleep is this instant.
+    if (reg === MPU_PWR_MGMT_1 && (stored & MPU_SLEEP) !== 0 && !this.asleep) {
+      this.lastAwake.set(this.encode());
+    }
+    this.regs[reg] = stored;
+  }
+
+  private latch(): void {
+    this.sample.set(this.asleep ? this.lastAwake : this.encode());
+    this.latchDue = false;
+  }
+
+  private encode(): Uint8Array {
+    const { inputs, regs } = this;
+    const accel = MPU6050_RULES.accel_lsb_per_g[(regs[MPU_ACCEL_CONFIG] >> 3) & 3];
+    const gyro = MPU6050_RULES.gyro_lsb_per_dps[(regs[MPU_GYRO_CONFIG] >> 3) & 3];
+    const block = [
+      inputs.accelX * accel,
+      inputs.accelY * accel,
+      inputs.accelZ * accel,
+      (inputs.temp - MPU6050_RULES.temp_offset_c) * MPU6050_RULES.temp_lsb_per_c,
+      inputs.gyroX * gyro,
+      inputs.gyroY * gyro,
+      inputs.gyroZ * gyro,
+    ];
+    const out = new Uint8Array(block.length * 2);
+    block.forEach((value, i) => {
+      const counts = mpuCounts(value);
+      out[2 * i] = (counts >> 8) & 0xff;
+      out[2 * i + 1] = counts & 0xff;
+    });
+    return out;
   }
 }
 
@@ -581,32 +774,27 @@ PartSimulationRegistry.register('mpu6050', {
     // Respect AD0 pin: `el.ad0 = true` → address 0x69, else 0x68
     const addr = el.ad0 === true || el.ad0 === 'true' ? 0x69 : 0x68;
     const device = new VirtualMPU6050(addr);
-    const part = attachI2cPart({ simulator, componentId, device, worker: { type: 'mpu6050' } });
-
-    const writeI16 = (regH: number, raw: number) => {
-      const v = Math.max(-32768, Math.min(32767, Math.round(raw))) & 0xffff;
-      device.registers[regH] = (v >> 8) & 0xff;
-      device.registers[regH + 1] = v & 0xff;
-    };
-
-    const writeValues = (values: Record<string, number | boolean>) => {
-      if ('accelX' in values) writeI16(0x3b, (values.accelX as number) * 16384);
-      if ('accelY' in values) writeI16(0x3d, (values.accelY as number) * 16384);
-      if ('accelZ' in values) writeI16(0x3f, (values.accelZ as number) * 16384);
-      if ('gyroX' in values) writeI16(0x43, (values.gyroX as number) * 131);
-      if ('gyroY' in values) writeI16(0x45, (values.gyroY as number) * 131);
-      if ('gyroZ' in values) writeI16(0x47, (values.gyroZ as number) * 131);
-      if ('temp' in values) writeI16(0x41, ((values.temp as number) - 36.53) * 340);
-    };
-    // The registers start at the panel's defaults (the chip model's own
-    // power-on values put the die at 25 C; the panel and the dialog say 24).
-    writeValues(getSensorControl('mpu6050')?.defaultValues ?? {});
+    // The world starts where the panel's sliders do.
+    device.setInputs(getSensorControl('mpu6050')?.defaultValues ?? {});
+    const part = attachI2cPart({
+      simulator,
+      componentId,
+      device,
+      // The worker's copy starts from the same values, under the names its
+      // sensor updates use, and not from defaults of its own.
+      worker: { type: 'mpu6050', props: { ...device.getInputs() } },
+    });
+    device.onAsleepRead = () =>
+      part.report(
+        'i2c-target-asleep',
+        `MPU6050 0x${addr.toString(16)} is in sleep mode: write 0x00 to PWR_MGMT_1 (0x6B) to wake it`,
+      );
 
     registerSensorUpdate(componentId, (values) => {
       // The worker's copy answers a QEMU board; this one answers every board
       // whose firmware runs in the tab, and the Pi relay reads its registers.
       part.updateWorker(values);
-      writeValues(values);
+      device.setInputs(values);
     });
 
     return () => {
@@ -1045,7 +1233,8 @@ PartSimulationRegistry.register('microsd-card', {
  *
  * Addresses:
  *   0x76 (SDO pin pulled LOW, default)
- *   0x77 (SDO pin pulled HIGH — set element.address = '0x77')
+ *   0x77 (SDO pin pulled HIGH — set element.address = '0x77', or
+ *         element.i2cAddress, which is the name a Grove brick sets)
  *
  * The element may expose `temperature` (°C) and `pressure` (hPa) properties
  * that are read on attach and forwarded to the virtual device.
@@ -1058,7 +1247,10 @@ PartSimulationRegistry.register('microsd-card', {
 PartSimulationRegistry.register('bmp280', {
   attachEvents: (element, simulator, _getPin, componentId) => {
     const el = element as any;
-    const addr = el.address === '0x77' || el.address === 0x77 ? 0x77 : 0x76;
+    // SDO selects one of two addresses, and the chip has no other. The Grove
+    // BMP280 sets `i2cAddress`: read as `address` only, the model sat at 0x76
+    // while Seeed's library asks 0x77 and waits for an answer with no timeout.
+    const addr = parseI2cAddress(el.i2cAddress ?? el.address, 0x76) === 0x77 ? 0x77 : 0x76;
     // An unset value starts where the panel and the property dialog say it
     // does (24 C, 1013.25 hPa), not at a literal of this part's own.
     const initTemp =

@@ -37,6 +37,18 @@ class TestWifiNicArg(unittest.TestCase):
         arg = wifi_nic_arg('esp32c3-picsimlab', wifi_enabled=True)
         self.assertIn('model=esp32c3_wifi', arg)
 
+    def test_c3_gets_no_nic_unless_the_sketch_uses_wifi(self):
+        """The C3 machine does not survive a radio it was handed.
+
+        With an esp32c3_wifi NIC present the fork resets the eFuse device
+        before it realizes it, and the worker aborts at boot with
+        `esp_efuse_reload_from_blk: Assertion 's->mirror' failed`. The radio
+        was unconditional, so every C3 run on QEMU died that way.
+        """
+        self.assertIsNone(wifi_nic_arg('esp32c3-picsimlab', wifi_enabled=False))
+        self.assertIsNone(
+            wifi_nic_arg('esp32c3-picsimlab', wifi_enabled=False, hostfwd_port=12345))
+
     def test_s3_gets_no_nic_because_it_models_no_radio(self):
         """hw/xtensa/esp32s3.c never looks for the NIC, so handing it one
         would leave an unconsumed netdev."""

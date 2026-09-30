@@ -19,7 +19,7 @@
  * this module adapts it to the fabric's target contract.
  */
 
-import { attachI2cTarget, type I2cTarget } from '../buses';
+import { attachI2cTarget, busRegistry, type BusDiagnosticCode, type I2cTarget } from '../buses';
 import type { I2CDevice } from '../I2CBusManager';
 import { chipVirtualPin } from '../customChips/chipVirtualPin';
 import { hostsChipsInWorker } from '../customChips/simulatorBridges';
@@ -35,6 +35,9 @@ import { hostsChipsInWorker } from '../customChips/simulatorBridges';
  * (M5Unified reads the BMI270's id twice that way), so the flag is cleared
  * there too. Only then: a stop() per transaction is also what repaints a
  * display, and doing it on every START would paint each frame twice.
+ *
+ * A model that has to know where a read begins hears every START itself
+ * (`start`): the MPU-6050 answers a burst from the sample it latched there.
  */
 export function i2cTargetOf(device: I2CDevice): I2cTarget & { dumpRegisters?: () => Uint8Array } {
   let open = false;
@@ -42,6 +45,7 @@ export function i2cTargetOf(device: I2CDevice): I2cTarget & { dumpRegisters?: ()
     start: (_address, read) => {
       if (open && !read) device.stop?.();
       open = true;
+      device.start?.(read);
       return true;
     },
     write: (byte) => device.writeByte(byte),
@@ -53,9 +57,11 @@ export function i2cTargetOf(device: I2CDevice): I2cTarget & { dumpRegisters?: ()
     // The MCU reset in the middle of a transaction: the part is back to
     // waiting for a pointer. Its registers are its own and stay.
     boardReset: () => {
-      if (!open) return;
-      open = false;
-      device.stop?.();
+      if (open) {
+        open = false;
+        device.stop?.();
+      }
+      device.boardReset?.();
     },
   };
   // A board whose guest reads the bus from somewhere else (the Pi relay)
@@ -93,6 +99,12 @@ export interface I2cPartOptions {
 export interface I2cPartHandle {
   /** Forward live values to the worker's copy (a no-op in the tab). */
   updateWorker(values: Record<string, unknown>): void;
+  /**
+   * Say something about the part's own state in the monitor of the board
+   * whose bus it is on, down the channel the bus diagnostics take. The part
+   * decides when: nothing here remembers what was already said.
+   */
+  report(code: BusDiagnosticCode, message: string): void;
   dispose(): void;
 }
 
@@ -157,6 +169,9 @@ export function attachI2cPart(opts: I2cPartOptions): I2cPartHandle {
   return {
     updateWorker: (values) => {
       if (workerPin !== null) sim!.updateSensor?.(workerPin, values);
+    },
+    report: (code, message) => {
+      if (owner) busRegistry.reportI2cTarget(owner, code, message);
     },
     dispose: () => {
       bus?.dispose();

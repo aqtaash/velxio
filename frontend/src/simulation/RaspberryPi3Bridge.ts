@@ -53,13 +53,28 @@ import type { RemoteSpiMapEntry } from './buses/registry';
  * the device has to be asked each time.
  */
 export interface PiBusTopology {
-  version: 1;
+  /**
+   * 2: this tab answers a numbered write (a request line that ends in
+   * `#<seq>`) with the device's registers and that number. The backend only
+   * numbers its writes, and only holds a copy back until they are answered,
+   * for a tab that says so; a tab that published version 1 gets neither.
+   */
+  version: 2;
   /**
    * `ask_writes`: a device that can NAK while present (I2cTarget.mayNak).
    * The backend asks this tab for the ACK of its writes instead of giving it
    * itself, so a NAK reaches the guest. Absent = the backend ACKs.
+   *
+   * `seq`: the number of the last write the backend sent to this device that
+   * `regs` includes. Absent = none was numbered yet.
    */
-  i2c: Array<{ bus: number; addr: number; regs: string | null; ask_writes?: true }>;
+  i2c: Array<{
+    bus: number;
+    addr: number;
+    regs: string | null;
+    ask_writes?: true;
+    seq?: number;
+  }>;
   /**
    * `responders` are the SPI devices with a portable model (the bus map an
    * ESP32 or STM32 worker gets, entry for entry): the backend runs them beside
@@ -503,9 +518,15 @@ export class RaspberryPi3Bridge {
     this._send({ type: 'pi_bus_attrs', data: { owner, attrs } });
   }
 
-  /** A register-file device's registers changed (`pi_bus_regs`). */
-  sendBusRegs(bus: number, address: number, regsHex: string): void {
-    this._send({ type: 'pi_bus_regs', data: { bus, addr: address, regs: regsHex } });
+  /**
+   * A register-file device's registers (`pi_bus_regs`). `seq` is the number of
+   * the last write the backend sent to the device that these registers
+   * include, when it numbered one: the backend tells by it a push computed
+   * before a guest's write from the one that answers that write. A backend
+   * that numbers nothing never reads it.
+   */
+  sendBusRegs(bus: number, address: number, regsHex: string, seq?: number): void {
+    this._send({ type: 'pi_bus_regs', data: { bus, addr: address, regs: regsHex, seq } });
   }
 
   private _send(payload: unknown): void {

@@ -5,8 +5,14 @@
  * Mirrors exactly what the frontend does:
  *   1. POST /api/compile/  → get firmware_b64
  *   2. WebSocket /api/simulation/ws/{id}
- *   3. send start_esp32 with firmware + sensors:[{sensor_type:'mpu6050',…}]
- *   4. Watch all events, log I2C state machine + serial output
+ *   3. send start_esp32 with firmware + sensors:[{sensor_type:'mpu6050',…}],
+ *      the record carrying where the panel's sliders are
+ *   4. Read the serial output and hold every printed value to the record
+ *   5. Move one slider (esp32_sensor_update) and hold the values again
+ *
+ * The sketch selects 8 g and 500 deg/s, so a model that ignores the range
+ * prints 39.23 m/s^2 for 1 g and twice the rotation; one that starts from
+ * values of its own prints its own temperature until a slider moves.
  *
  * Run from the backend/ directory:
  *   node test_mpu6050_simulation.mjs [--timeout 30]
@@ -19,6 +25,15 @@ const BACKEND   = process.env.BACKEND_URL ?? process.argv.find(a => a.startsWith
 const WS_BASE   = BACKEND.replace(/^https?:/, m => m === 'https:' ? 'wss:' : 'ws:');
 const SESSION   = `test-mpu6050-${Date.now()}`;
 const TIMEOUT_S = parseInt(process.argv.find(a => a.startsWith('--timeout='))?.slice(10) ?? '40');
+
+// The low byte of an I2C event, as the worker names it (esp32_worker.py,
+// _I2C_OP_NAME): QEMU's enum i2c_event, then the write and the read of
+// hw/i2c/picsimlab_i2c.c.
+const I2C_OP = {
+  0x00: 'START_RECV', 0x01: 'START_SEND', 0x02: 'START_ASYNC',
+  0x03: 'FINISH',     0x04: 'NACK',
+  0x05: 'WRITE',      0x06: 'READ',
+};
 
 // ─── MPU-6050 sketch (same as the example in examples.ts) ────────────────────
 const SKETCH = `// ESP32 — MPU-6050 Accelerometer & Gyroscope (I2C)
@@ -50,112 +65,58 @@ void loop() {
 
   Serial.printf("Accel X=%.2f Y=%.2f Z=%.2f m/s^2\\n",
     a.acceleration.x, a.acceleration.y, a.acceleration.z);
-  Serial.printf("Gyro  X=%.2f Y=%.2f Z=%.2f rad/s\\n",
+  Serial.printf("Gyro  X=%.3f Y=%.3f Z=%.3f rad/s\\n",
     g.gyro.x, g.gyro.y, g.gyro.z);
   Serial.printf("Temp: %.1f C\\n---\\n", temp.temperature);
   delay(500);
 }`;
 
-// ─── I2C event decoder (mirrors Python esp32_i2c_slaves.py constants) ─────────
-const I2C_OP = { 0x00: 'STOP', 0x01: 'START', 0x03: 'READ', 0x05: 'WRITE_FIRST', 0x06: 'WRITE_CONT' };
+// ─── What the panel holds, and what the sketch must print for it ─────────────
+// The record the tab's part files for the worker (parts/ProtocolParts.ts): the
+// panel's values under the names its updates use. None of them is a value the
+// model starts from by itself.
+const PANEL = { accelX: 0.5, accelY: -0.25, accelZ: 1, gyroX: 100, gyroY: 0, gyroZ: -50, temp: 30.5 };
+// One slider moves while the sketch runs; the others stay.
+const MOVED = { accelX: -1 };
 
-// Local mirror of the MPU6050 slave state machine — tracks the same logic as
-// Python's MPU6050Slave so we can annotate WHICH firmware call each event came from.
-class MPU6050StateMirror {
-  constructor() {
-    this.reg_ptr         = 0x75;
-    this.first_byte      = true;
-    this._who_am_i_count = 0;
-    this.regs            = new Uint8Array(256);
-    // WHO_AM_I = 0x68
-    this.regs[0x75] = 0x68;
-    // ACCEL_Z = +1g = 0x40 (MSB at 0x3F)
-    this.regs[0x3F] = 0x40;
-    // TEMP raw for 25°C
-    const tempRaw = Math.round((25.0 - 36.53) * 340) & 0xFFFF;
-    this.regs[0x41] = (tempRaw >> 8) & 0xFF;
-    this.regs[0x42] =  tempRaw       & 0xFF;
-    this.eventCount = 0;
-    this.readCount  = 0;
-  }
+const G = 9.80665;                 // SENSORS_GRAVITY_STANDARD, m/s^2 per g
+const DPS = Math.PI / 180;         // SENSORS_DPS_TO_RADS
+// Half a count at the ranges the sketch selects (4096 LSB/g, 65.5 LSB per
+// deg/s, 340 LSB per C), plus the rounding of the print.
+const TOLERANCE = { accel: 0.01, gyro: 0.001, temp: 0.06 };
 
-  handle(event) {
-    const op   = event & 0xFF;
-    const data = (event >> 8) & 0xFF;
-    this.eventCount++;
-    let val = 0;
-    let note = '';
-
-    if (op === 0x01) { // I2C_START
-      this.first_byte = true;
-      if (this._who_am_i_count >= 2) {
-        this.reg_ptr = 0x3B;
-        note = `DATA_MODE  (count=${this._who_am_i_count} ≥ 2)`;
-      } else {
-        this.reg_ptr = 0x75;
-        note = `WHO_AM_I_MODE (count=${this._who_am_i_count} < 2)`;
-      }
-      val = 1;
-    } else if (op === 0x05 || op === 0x06) { // WRITE
-      if (this.first_byte) {
-        this.reg_ptr    = data;
-        this.first_byte = false;
-        note = `set reg_ptr=0x${data.toString(16).padStart(2,'0')} (${REG_NAME[data] ?? '?'})`;
-      } else {
-        this.regs[this.reg_ptr] = data;
-        if (this.reg_ptr === 0x6B) this.regs[0x6B] &= 0x7F; // auto-clear DEVICE_RESET
-        note = `write 0x${data.toString(16).padStart(2,'0')} → reg[0x${this.reg_ptr.toString(16).padStart(2,'0')}]`;
-        this.reg_ptr = (this.reg_ptr + 1) & 0xFF;
-      }
-      val = 1;
-    } else if (op === 0x03) { // READ
-      this.readCount++;
-      val = this.regs[this.reg_ptr];
-      if (this.reg_ptr === 0x75 && val === 0x68) {
-        this._who_am_i_count++;
-        note = `WHO_AM_I read #${this._who_am_i_count} → 0x68`;
-      } else {
-        note = `reg[0x${this.reg_ptr.toString(16).padStart(2,'0')}]=${FRIENDLY_REG(this.reg_ptr, val)}`;
-      }
-      this.reg_ptr = (this.reg_ptr + 1) & 0xFF;
-    } else { // STOP
-      this.first_byte = true;
-      note = 'transaction end';
-    }
-
-    return { val, note };
-  }
-
-  /** Guess which firmware function triggered this event sequence */
-  guessPhase() {
-    const c = this._who_am_i_count;
-    const r = this.readCount;
-    if (c === 0)  return 'before_begin / detected()';
-    if (c === 1)  return 'chip_id.read() or reset() read-modify-write';
-    if (c === 2 && r <= 3) return 'reset() wait loop or setFilterBandwidth';
-    if (c >= 2)   return '_init() config setup OR sketch getEvent() loop';
-    return '?';
-  }
+/** What getEvent() returns for these panel values, in the units it prints. */
+function expected(panel) {
+  return {
+    accel: [panel.accelX * G, panel.accelY * G, panel.accelZ * G],
+    gyro:  [panel.gyroX * DPS, panel.gyroY * DPS, panel.gyroZ * DPS],
+    temp:  panel.temp,
+  };
 }
 
-// Known MPU-6050 register names
-const REG_NAME = {
-  0x19: 'SMPRT_DIV', 0x1A: 'CONFIG', 0x1B: 'GYRO_CONFIG', 0x1C: 'ACCEL_CONFIG',
-  0x3B: 'ACCEL_XOUT_H', 0x3C: 'ACCEL_XOUT_L', 0x3D: 'ACCEL_YOUT_H', 0x3E: 'ACCEL_YOUT_L',
-  0x3F: 'ACCEL_ZOUT_H', 0x40: 'ACCEL_ZOUT_L',
-  0x41: 'TEMP_OUT_H',   0x42: 'TEMP_OUT_L',
-  0x43: 'GYRO_XOUT_H',  0x44: 'GYRO_XOUT_L',  0x45: 'GYRO_YOUT_H', 0x46: 'GYRO_YOUT_L',
-  0x47: 'GYRO_ZOUT_H',  0x48: 'GYRO_ZOUT_L',
-  0x6B: 'PWR_MGMT_1',  0x6C: 'PWR_MGMT_2',
-  0x68: 'SIGNAL_PATH_RESET',
-  0x75: 'WHO_AM_I',
-};
+/** One printed block (Accel, Gyro, Temp lines) as numbers, or null while incomplete. */
+function parseReading(lines) {
+  const three = (line) => line?.match(/X=(-?[\d.]+) Y=(-?[\d.]+) Z=(-?[\d.]+)/)?.slice(1).map(Number);
+  const accel = three(lines.find(l => l.startsWith('Accel')));
+  const gyro  = three(lines.find(l => l.startsWith('Gyro')));
+  const temp  = lines.find(l => l.startsWith('Temp:'))?.match(/Temp: (-?[\d.]+)/)?.[1];
+  if (!accel || !gyro || temp === undefined) return null;
+  return { accel, gyro, temp: Number(temp) };
+}
 
-function FRIENDLY_REG(reg, val) {
-  const name = REG_NAME[reg];
-  const hex  = `0x${val.toString(16).padStart(2,'0')}`;
-  if (name) return `${hex} [${name}]`;
-  return hex;
+/** Every value of a reading that is not what the panel says, as text. */
+function mismatches(reading, panel) {
+  const want = expected(panel);
+  const out = [];
+  ['X', 'Y', 'Z'].forEach((axis, i) => {
+    if (Math.abs(reading.accel[i] - want.accel[i]) > TOLERANCE.accel)
+      out.push(`Accel ${axis}=${reading.accel[i]} (expected ${want.accel[i].toFixed(2)})`);
+    if (Math.abs(reading.gyro[i] - want.gyro[i]) > TOLERANCE.gyro)
+      out.push(`Gyro ${axis}=${reading.gyro[i]} (expected ${want.gyro[i].toFixed(3)})`);
+  });
+  if (Math.abs(reading.temp - want.temp) > TOLERANCE.temp)
+    out.push(`Temp=${reading.temp} (expected ${want.temp.toFixed(1)})`);
+  return out;
 }
 
 // ─── Logging helpers ───────────────────────────────────────────────────────────
@@ -176,9 +137,17 @@ let totalEvents   = 0;
 let i2cEvents     = 0;
 let i2cTraceCount = 0;
 let serialLines   = [];
+let serialText    = '';
 let foundOK       = false;
 let foundFail     = false;
-const mirror      = new MPU6050StateMirror();
+// The printed blocks, in order, each with the panel values it was read under.
+let block         = [];
+let readings      = [];
+let panel         = { ...PANEL };
+let updateSent    = false;
+let inFlight      = 0;
+const READINGS_BEFORE_UPDATE = 3;
+const READINGS_AFTER_UPDATE  = 3;
 
 // ─── Step 1: Compile the sketch ───────────────────────────────────────────────
 async function compile() {
@@ -231,8 +200,8 @@ function runSimulation(firmware_b64) {
           board:        'esp32',
           firmware_b64,
           sensors: [
-            // Mirror what useSimulatorStore sends for wokwi-mpu6050 component
-            { sensor_type: 'mpu6050', pin: 200 + 0x68, addr: 0x68 }
+            // Mirror what the mpu6050 part files for the worker
+            { sensor_type: 'mpu6050', pin: 200 + 0x68, addr: 0x68, ...PANEL }
           ],
           wifi_enabled: false,
         },
@@ -250,9 +219,12 @@ function runSimulation(firmware_b64) {
 
       // ── Serial output ──────────────────────────────────────────────────────
       if (type === 'serial_output') {
-        const text = (data?.data ?? '').trim();
-        if (!text) return;
-        for (const line of text.split(/\r?\n/)) {
+        // A message is whatever the UART had when it was flushed, not a line:
+        // a printf with a float in it arrives in pieces.
+        serialText += data?.data ?? '';
+        const lines = serialText.split(/\r?\n/);
+        serialText = lines.pop();
+        for (const line of lines) {
           if (!line.trim()) continue;
           serialLines.push(line);
           serial(`UART: ${line}`);
@@ -263,8 +235,26 @@ function runSimulation(firmware_b64) {
             foundFail = true;
             warn('begin() returned FALSE — firmware reported "not found"');
           }
-          // If we got sensor data, stop after a few lines
-          if (foundOK && serialLines.filter(l => l.startsWith('Accel')).length >= 3) {
+          // A block is complete at its separator.
+          if (line.startsWith('---')) {
+            const reading = parseReading(block);
+            block = [];
+            if (reading && inFlight > 0) inFlight--;
+            else if (reading) readings.push({ reading, panel: { ...panel }, afterUpdate: updateSent });
+          } else {
+            block.push(line);
+          }
+          if (foundOK && !updateSent && readings.length >= READINGS_BEFORE_UPDATE) {
+            info('Moving one slider:', JSON.stringify(MOVED));
+            ws.send(JSON.stringify({ type: 'esp32_sensor_update',
+                                     data: { pin: 200 + 0x68, ...MOVED } }));
+            updateSent = true;
+            panel = { ...panel, ...MOVED };
+            // The block in print and the one after it may have been read
+            // before the update reached the worker: they prove nothing.
+            inFlight = 2;
+          }
+          if (readings.filter(r => r.afterUpdate).length >= READINGS_AFTER_UPDATE) {
             clearTimeout(timer);
             ws.close();
             resolve({ timedOut: false });
@@ -278,7 +268,8 @@ function runSimulation(firmware_b64) {
         return;
       }
 
-      // ── I2C trace (Python slave handled the event — always emitted for debug) ─
+      // ── I2C trace (the worker's model answered the event). Only a backend
+      //    started with VELXIO_I2C_TRACE=1 emits it; the test does not need it. ─
       if (type === 'i2c_trace') {
         i2cTraceCount++;
         const { bus, addr, event, op, result, reg_ptr, wai_count } = data;
@@ -362,7 +353,7 @@ async function main() {
   console.log('\n' + '─'.repeat(60));
   console.log(' Starting simulation...');
   console.log('─'.repeat(60) + '\n');
-  info('NOTE: I2C trace events emitted by backend are shown below with [slave] prefix.');
+  info('NOTE: a backend started with VELXIO_I2C_TRACE=1 also shows its I2C trace, with [slave] prefix.');
   console.log();
 
   const result = await runSimulation(firmware_b64);
@@ -381,8 +372,19 @@ async function main() {
   for (const l of serialLines) console.log(`    ${l}`);
   console.log();
 
-  if (foundOK) {
-    console.log('\x1b[32m  ✓ PASS — MPU6050 detected and sensor data flowing\x1b[0m');
+  const wrong = readings.flatMap(({ reading, panel: p, afterUpdate }, i) =>
+    mismatches(reading, p).map(m => `reading ${i + 1}${afterUpdate ? ' (after the slider moved)' : ''}: ${m}`));
+  const before = readings.filter(r => !r.afterUpdate).length;
+  const after  = readings.filter(r => r.afterUpdate).length;
+  console.log(`  Readings checked                : ${before} before the slider moved, ${after} after`);
+  console.log();
+
+  if (foundOK && wrong.length > 0) {
+    console.log('\x1b[31m  ✗ FAIL — the sketch printed values the panel does not hold\x1b[0m');
+    for (const w of wrong) console.log(`    ${w}`);
+    process.exit(1);
+  } else if (foundOK && before >= READINGS_BEFORE_UPDATE && after >= READINGS_AFTER_UPDATE) {
+    console.log('\x1b[32m  ✓ PASS — MPU6050 detected, and every reading is what the panel holds\x1b[0m');
     process.exit(0);
   } else if (foundFail) {
     console.log('\x1b[31m  ✗ FAIL — mpu.begin() returned false ("not found")\x1b[0m');

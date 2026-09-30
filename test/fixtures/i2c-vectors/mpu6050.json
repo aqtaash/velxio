@@ -1,0 +1,355 @@
+{
+  "_comment": "Bus vectors for the InvenSense MPU-6050, shared by the tab model (frontend/src/simulation/parts/ProtocolParts.ts, vitest) and the backend twin (backend/app/services/esp32_i2c_slaves.py, pytest). The format is in README.md next to this file. Register facts are from the register map RM-MPU-6000A-00 rev 4.2; driver traces name the source they were read from.",
+  "format": 1,
+  "device": "mpu6050",
+  "address": "68",
+  "rules": {
+    "power_on": { "6B": "40", "75": "68" },
+    "read_only": [["36", "36"], ["3A", "3A"], ["3B", "60"], ["72", "73"], ["75", "75"]],
+    "self_clearing": { "68": "FF", "6A": "0F", "6B": "80" },
+    "accel_lsb_per_g": [16384, 8192, 4096, 2048],
+    "gyro_lsb_per_dps": [131, 65.5, 32.8, 16.4],
+    "temp_lsb_per_c": 340,
+    "temp_offset_c": 36.53
+  },
+  "inputs": { "accelX": 0, "accelY": 0, "accelZ": 1, "gyroX": 0, "gyroY": 0, "gyroZ": 0, "temp": 24 },
+  "vectors": [
+    {
+      "name": "power-on: PWR_MGMT_1 reads 0x40, WHO_AM_I reads 0x68, every other register reads 0x00",
+      "spec": "RM section 3: reset value 0x00 for all registers but 107 (0x40) and 117 (0x68)",
+      "steps": [
+        { "op": "read", "reg": "6B", "n": 1, "expect": "40" },
+        { "op": "read", "reg": "75", "n": 1, "expect": "68" },
+        { "op": "read", "reg": "00", "n": 256, "expect": "00*107 40 00*9 68 00*138" }
+      ]
+    },
+    {
+      "name": "a read/write register reads back what was written, one byte or a run of them",
+      "spec": "RM sections 4.2 to 4.5, 4.15, 4.28, 4.29",
+      "steps": [
+        { "op": "write", "data": "19 07" },
+        { "op": "read", "reg": "19", "n": 1, "expect": "07" },
+        { "op": "write", "data": "1A 03 18 10" },
+        { "op": "read", "reg": "19", "n": 4, "expect": "07 03 18 10" },
+        { "op": "write", "data": "38 01" },
+        { "op": "read", "reg": "38", "n": 1, "expect": "01" },
+        { "op": "write", "data": "6C 3F" },
+        { "op": "read", "reg": "6C", "n": 1, "expect": "3F" },
+        { "op": "write", "data": "6B 01" },
+        { "op": "read", "reg": "6B", "n": 1, "expect": "01" },
+        { "op": "write", "data": "6B 41" },
+        { "op": "read", "reg": "6B", "n": 1, "expect": "41" },
+        { "op": "write", "data": "6B 28" },
+        { "op": "read", "reg": "6B", "n": 1, "expect": "28" }
+      ]
+    },
+    {
+      "name": "a write to a read-only register changes nothing, and the pointer still moves past it",
+      "spec": "RM sections 4.13 (I2C_MST_STATUS), 4.16 to 4.20 (INT_STATUS, sample block, external sensor data), 4.30 (FIFO_COUNT), 4.32 (WHO_AM_I): Type Read Only",
+      "steps": [
+        { "op": "write", "data": "6B 00" },
+        { "op": "write", "data": "36 FF" },
+        { "op": "read", "reg": "36", "n": 1, "expect": "00" },
+        { "op": "write", "data": "34 11 22 33 44" },
+        { "op": "read", "reg": "34", "n": 4, "expect": "11 22 00 44" },
+        { "op": "write", "data": "3A FF" },
+        { "op": "read", "reg": "3A", "n": 1, "expect": "00" },
+        { "op": "write", "data": "3B AA*38 AB" },
+        { "op": "read", "reg": "3B", "n": 14, "expect": "00 00 00 00 40 00 EF 5C 00 00 00 00 00 00" },
+        { "op": "read", "reg": "49", "n": 24, "expect": "00*24" },
+        { "op": "read", "reg": "61", "n": 1, "expect": "AB" },
+        { "op": "write", "data": "72 12 34" },
+        { "op": "read", "reg": "72", "n": 2, "expect": "00 00" },
+        { "op": "write", "data": "75 00" },
+        { "op": "read", "reg": "75", "n": 1, "expect": "68" }
+      ]
+    },
+    {
+      "name": "DEVICE_RESET: 0xC0 written to PWR_MGMT_1 reads back 0x40, the configuration returns to 0x00, what the panel set stays",
+      "spec": "RM section 4.28: DEVICE_RESET resets all internal registers to their default values and clears itself",
+      "steps": [
+        { "op": "write", "data": "6B 01" },
+        { "op": "write", "data": "19 07 03 18 10" },
+        { "op": "write", "data": "38 01" },
+        { "op": "write", "data": "6A 40" },
+        { "op": "inputs", "values": { "accelX": 0.5, "gyroY": -100 } },
+        { "op": "read", "reg": "3B", "n": 14, "expect": "08 00 00 00 10 00 EF 5C 00 00 F9 98 00 00" },
+        { "op": "write", "data": "6B C0" },
+        { "op": "read", "reg": "6B", "n": 1, "expect": "40" },
+        { "op": "read", "reg": "19", "n": 4, "expect": "00 00 00 00" },
+        { "op": "read", "reg": "38", "n": 1, "expect": "00" },
+        { "op": "read", "reg": "6A", "n": 1, "expect": "00" },
+        { "op": "read", "reg": "3B", "n": 14, "expect": "00*14" },
+        { "op": "write", "data": "6B 00" },
+        { "op": "read", "reg": "3B", "n": 14, "expect": "20 00 00 00 40 00 EF 5C 00 00 CC D4 00 00" },
+        { "op": "write", "data": "6B 80" },
+        { "op": "read", "reg": "6B", "n": 1, "expect": "40" }
+      ]
+    },
+    {
+      "name": "SIGNAL_PATH_RESET is write-only and the reset bits of USER_CTRL clear themselves",
+      "spec": "RM section 4.26 (Type Write Only), section 4.27 (the reset bits trigger a reset and then clear to 0); bit 3 is the DMP reset of InvenSense's driver",
+      "steps": [
+        { "op": "write", "data": "68 07" },
+        { "op": "read", "reg": "68", "n": 1, "expect": "00" },
+        { "op": "write", "data": "6A 07" },
+        { "op": "read", "reg": "6A", "n": 1, "expect": "00" },
+        { "op": "write", "data": "6A 4F" },
+        { "op": "read", "reg": "6A", "n": 1, "expect": "40" },
+        { "op": "write", "data": "6A FF" },
+        { "op": "read", "reg": "6A", "n": 1, "expect": "F0" }
+      ]
+    },
+    {
+      "name": "full scale: 1 g reads 16384, 8192, 4096, 2048 and 100 deg/s reads 13100, 6550, 3280, 1640 as AFS_SEL and FS_SEL go 0 to 3",
+      "spec": "RM section 4.17 (LSB per g by AFS_SEL), section 4.19 (LSB per deg/s by FS_SEL), section 4.18 (TEMP_OUT)",
+      "steps": [
+        { "op": "write", "data": "6B 00" },
+        { "op": "inputs", "values": { "gyroX": 100 } },
+        { "op": "write", "data": "1B 00 00" },
+        { "op": "read", "reg": "3B", "n": 14, "expect": "00 00 00 00 40 00 EF 5C 33 2C 00 00 00 00" },
+        { "op": "write", "data": "1B 08 08" },
+        { "op": "read", "reg": "3B", "n": 14, "expect": "00 00 00 00 20 00 EF 5C 19 96 00 00 00 00" },
+        { "op": "write", "data": "1B 10 10" },
+        { "op": "read", "reg": "3B", "n": 14, "expect": "00 00 00 00 10 00 EF 5C 0C D0 00 00 00 00" },
+        { "op": "write", "data": "1B 18 18" },
+        { "op": "read", "reg": "3B", "n": 14, "expect": "00 00 00 00 08 00 EF 5C 06 68 00 00 00 00" }
+      ]
+    },
+    {
+      "name": "counts saturate at 32767 and -32768, and fit again once the range is wide enough",
+      "spec": "RM sections 4.17 and 4.19: 16-bit 2's complement values",
+      "steps": [
+        { "op": "write", "data": "6B 00" },
+        { "op": "inputs", "values": { "accelX": 4, "accelY": -4, "accelZ": 2, "gyroX": 300, "gyroY": -300, "gyroZ": 250.1 } },
+        { "op": "read", "reg": "3B", "n": 14, "expect": "7F FF 80 00 7F FF EF 5C 7F FF 80 00 7F FB" },
+        { "op": "write", "data": "1B 18 18" },
+        { "op": "read", "reg": "3B", "n": 14, "expect": "20 00 E0 00 10 00 EF 5C 13 38 EC C8 10 06" }
+      ]
+    },
+    {
+      "name": "less than half a count under positive full scale reads 32767, not the negative end of the scale",
+      "spec": "RM sections 4.17 to 4.19: 16-bit 2's complement values; model rule: round, then saturate. 1.99998 g is 32767.67 counts at 16384 LSB per g, 250.135 deg/s is 32767.68 at 131 LSB per deg/s, 132.9055 C and -59.8455 C are 32767.67 counts each side of 36.53 C",
+      "steps": [
+        { "op": "write", "data": "6B 00" },
+        { "op": "inputs", "values": { "accelX": 1.99998, "accelY": -1.99998, "gyroX": 250.135, "gyroY": -250.135, "temp": 132.9055 } },
+        { "op": "read", "reg": "3B", "n": 14, "expect": "7F FF 80 00 40 00 7F FF 7F FF 80 00 00 00" },
+        { "op": "inputs", "values": { "temp": -59.8455 } },
+        { "op": "read", "reg": "41", "n": 2, "expect": "80 00" }
+      ]
+    },
+    {
+      "name": "half a count rounds away from zero, the same on both sides of rest",
+      "spec": "model rule: 1, -1 and 3 deg/s at 65.5 LSB per deg/s are 65.5, -65.5 and 196.5 counts",
+      "steps": [
+        { "op": "write", "data": "6B 00" },
+        { "op": "write", "data": "1B 08" },
+        { "op": "inputs", "values": { "gyroX": 1, "gyroY": -1, "gyroZ": 3 } },
+        { "op": "read", "reg": "43", "n": 6, "expect": "00 42 FF BE 00 C5" }
+      ]
+    },
+    {
+      "name": "a burst is one sample: the panel moving in the middle of it does not tear it",
+      "spec": "RM section 4.17: a burst read of sensor registers reads measurements from the same sampling instant",
+      "steps": [
+        { "op": "write", "data": "6B 00" },
+        { "op": "inputs", "values": { "accelX": 0.25, "gyroZ": 10 } },
+        { "op": "start", "rw": "w" },
+        { "op": "send", "data": "3B" },
+        { "op": "start", "rw": "r" },
+        { "op": "recv", "n": 6, "expect": "10 00 00 00 40 00" },
+        { "op": "inputs", "values": { "accelX": -0.25, "accelZ": -1, "temp": 40, "gyroZ": -10 } },
+        { "op": "recv", "n": 8, "expect": "EF 5C 00 00 00 00 05 1E" },
+        { "op": "stop" },
+        { "op": "read", "reg": "3B", "n": 14, "expect": "F0 00 00 00 C0 00 04 9C 00 00 00 00 FA E2" }
+      ]
+    },
+    {
+      "name": "asleep: the sample block holds what it held when SLEEP was set, zeros after power-on",
+      "spec": "RM section 4 (the device comes up in sleep mode), section 4.28 (SLEEP); the chip samples until it falls asleep",
+      "steps": [
+        { "op": "inputs", "values": { "accelX": 1 } },
+        { "op": "read", "reg": "3B", "n": 14, "expect": "00*14" },
+        { "op": "write", "data": "6B 00" },
+        { "op": "read", "reg": "3B", "n": 14, "expect": "40 00 00 00 40 00 EF 5C 00*6" },
+        { "op": "inputs", "values": { "accelX": 0.5 } },
+        { "op": "write", "data": "6B 40" },
+        { "op": "read", "reg": "3B", "n": 14, "expect": "20 00 00 00 40 00 EF 5C 00*6" },
+        { "op": "inputs", "values": { "accelX": -1, "gyroX": 50 } },
+        { "op": "read", "reg": "3B", "n": 14, "expect": "20 00 00 00 40 00 EF 5C 00*6" },
+        { "op": "write", "data": "1C 18" },
+        { "op": "read", "reg": "3B", "n": 14, "expect": "20 00 00 00 40 00 EF 5C 00*6" },
+        { "op": "write", "data": "6B 00" },
+        { "op": "read", "reg": "3B", "n": 14, "expect": "F8 00 00 00 08 00 EF 5C 19 96 00 00 00 00" }
+      ]
+    },
+    {
+      "name": "SIG_COND_RESET clears the sample a sleeping chip holds",
+      "spec": "RM section 4.27: SIG_COND_RESET also clears the sensor registers; section 4.26: SIGNAL_PATH_RESET does not",
+      "steps": [
+        { "op": "write", "data": "6B 00" },
+        { "op": "write", "data": "6B 40" },
+        { "op": "write", "data": "68 07" },
+        { "op": "read", "reg": "3B", "n": 14, "expect": "00 00 00 00 40 00 EF 5C 00*6" },
+        { "op": "write", "data": "6A 01" },
+        { "op": "read", "reg": "3B", "n": 14, "expect": "00*14" },
+        { "op": "read", "reg": "6A", "n": 1, "expect": "00" }
+      ]
+    },
+    {
+      "name": "the register dump a host mirrors carries the encoded sample and no trigger bit",
+      "spec": "what the Raspberry Pi relay copies: the registers as a read would find them",
+      "steps": [
+        { "op": "dump", "at": "00", "expect": "00*107 40 00*9 68 00*138" },
+        { "op": "write", "data": "6B 01" },
+        { "op": "write", "data": "1B 08 10" },
+        { "op": "inputs", "values": { "accelY": -0.5, "gyroZ": 20 } },
+        { "op": "dump", "at": "3B", "expect": "00 00 F8 00 10 00 EF 5C 00 00 00 00 05 1E" },
+        { "op": "dump", "at": "1B", "expect": "08 10" },
+        { "op": "write", "data": "68 07" },
+        { "op": "write", "data": "6A 47" },
+        { "op": "dump", "at": "68", "expect": "00 00 40 01" },
+        { "op": "write", "data": "6B 41" },
+        { "op": "inputs", "values": { "accelY": 1 } },
+        { "op": "dump", "at": "3B", "expect": "00 00 F8 00 10 00 EF 5C 00 00 00 00 05 1E" }
+      ]
+    },
+    {
+      "name": "reads follow the pointer: it survives a STOP, moves past every byte and wraps at 0xFF",
+      "spec": "RM section 4.17 burst reads; the pointer model of the twins",
+      "steps": [
+        { "op": "write", "data": "6B 00" },
+        { "op": "inputs", "values": { "accelX": 1 } },
+        { "op": "write", "data": "FE A1 A2 A3 A4" },
+        { "op": "read", "reg": "FE", "n": 4, "expect": "A1 A2 A3 A4" },
+        { "op": "write", "data": "75" },
+        { "op": "get", "n": 1, "expect": "68" },
+        { "op": "get", "n": 2, "expect": "00 00" },
+        { "op": "read", "reg": "39", "n": 4, "expect": "00 00 40 00" }
+      ]
+    },
+    {
+      "name": "a burst write gives every byte the rule of the register it lands on, and a burst read runs out of the sample block",
+      "spec": "RM sections 4.26 to 4.29, each register's own type and reset bits; section 4.19 for the read that leaves the block at 0x48. The sample is read only while PWR_MGMT_2 holds no STBY bit, so a model that gates the axes passes too. DEVICE_RESET is the last byte of its burst: the register map does not say what the chip does with bytes that follow it",
+      "steps": [
+        { "op": "write", "data": "67 11 07 22 4F 00 C0" },
+        { "op": "read", "reg": "67", "n": 6, "expect": "11 00 22 40 00 C0" },
+        { "op": "inputs", "values": { "accelX": 1, "gyroZ": 10 } },
+        { "op": "read", "reg": "47", "n": 4, "expect": "05 1E 00 00" },
+        { "op": "write", "data": "6A 60 40" },
+        { "op": "inputs", "values": { "gyroZ": 20 } },
+        { "op": "read", "reg": "6A", "n": 3, "expect": "60 40 C0" },
+        { "op": "read", "reg": "47", "n": 4, "expect": "05 1E 00 00" },
+        { "op": "write", "data": "6B 00 07" },
+        { "op": "read", "reg": "6B", "n": 2, "expect": "00 07" },
+        { "op": "write", "data": "69 33 40 80" },
+        { "op": "read", "reg": "67", "n": 6, "expect": "00 00 00 00 40 00" }
+      ]
+    },
+    {
+      "name": "driver: Adafruit_MPU6050 2.2.9 begin(), the gallery setup (8 g, 500 deg/s, 21 Hz), getEvent() at rest and at 100 deg/s",
+      "spec": "Adafruit_MPU6050.cpp begin(), _init(), reset(), _read(); Adafruit BusIO 1.17.4 Adafruit_I2CDevice::detected(), Adafruit_BusIO_Register::read()/write(), Adafruit_BusIO_RegisterBits::write()",
+      "driver": "adafruit-mpu6050-arduino",
+      "steps": [
+        { "op": "write", "data": "" },
+        { "op": "read", "reg": "75", "n": 1, "expect": "68" },
+        { "op": "read", "reg": "6B", "n": 1, "expect": "40" },
+        { "op": "write", "data": "6B C0" },
+        { "op": "read", "reg": "6B", "n": 1, "expect": "40" },
+        { "op": "write", "data": "68 07" },
+        { "op": "write", "data": "19 00" },
+        { "op": "read", "reg": "1A", "n": 1, "expect": "00" },
+        { "op": "write", "data": "1A 00" },
+        { "op": "read", "reg": "1B", "n": 1, "expect": "00" },
+        { "op": "write", "data": "1B 08" },
+        { "op": "read", "reg": "1C", "n": 1, "expect": "00" },
+        { "op": "write", "data": "1C 00" },
+        { "op": "write", "data": "6B 01" },
+        { "op": "read", "reg": "1C", "n": 1, "expect": "00" },
+        { "op": "write", "data": "1C 10" },
+        { "op": "read", "reg": "1B", "n": 1, "expect": "08" },
+        { "op": "write", "data": "1B 08" },
+        { "op": "read", "reg": "1A", "n": 1, "expect": "00" },
+        { "op": "write", "data": "1A 04" },
+        { "op": "read", "reg": "3B", "n": 14, "expect": "00 00 00 00 10 00 EF 5C 00 00 00 00 00 00" },
+        { "op": "read", "reg": "1C", "n": 1, "expect": "10" },
+        { "op": "read", "reg": "1B", "n": 1, "expect": "08" },
+        { "op": "inputs", "values": { "gyroX": 100 } },
+        { "op": "read", "reg": "3B", "n": 14, "expect": "00 00 00 00 10 00 EF 5C 19 96 00 00 00 00" },
+        { "op": "read", "reg": "1C", "n": 1, "expect": "10" },
+        { "op": "read", "reg": "1B", "n": 1, "expect": "08" }
+      ]
+    },
+    {
+      "name": "driver: CircuitPython adafruit_mpu6050 1.3.9 MPU6050(), acceleration, gyro, temperature",
+      "spec": "adafruit_mpu6050.py __init__(), reset(); adafruit_register 1.13.0 RWBit, RWBits, UnaryStruct, StructArray; adafruit_bus_device 5.2.17 I2CDevice",
+      "driver": "adafruit-mpu6050-circuitpython",
+      "steps": [
+        { "op": "write", "data": "" },
+        { "op": "read", "reg": "75", "n": 1, "expect": "68" },
+        { "op": "read", "reg": "6B", "n": 1, "expect": "40" },
+        { "op": "write", "data": "6B C0" },
+        { "op": "read", "reg": "6B", "n": 1, "expect": "40" },
+        { "op": "read", "reg": "68", "n": 1, "expect": "00" },
+        { "op": "write", "data": "68 38" },
+        { "op": "read", "reg": "1A", "n": 1, "expect": "00" },
+        { "op": "write", "data": "1A 00" },
+        { "op": "read", "reg": "1B", "n": 1, "expect": "00" },
+        { "op": "write", "data": "1B 08" },
+        { "op": "read", "reg": "1C", "n": 1, "expect": "00" },
+        { "op": "write", "data": "1C 00" },
+        { "op": "read", "reg": "1C", "n": 1, "expect": "00" },
+        { "op": "read", "reg": "6B", "n": 1, "expect": "40" },
+        { "op": "write", "data": "6B 41" },
+        { "op": "read", "reg": "6B", "n": 1, "expect": "41" },
+        { "op": "write", "data": "6B 01" },
+        { "op": "inputs", "values": { "gyroX": 100 } },
+        { "op": "read", "reg": "3B", "n": 2, "expect": "00 00" },
+        { "op": "read", "reg": "3D", "n": 2, "expect": "00 00" },
+        { "op": "read", "reg": "3F", "n": 2, "expect": "40 00" },
+        { "op": "read", "reg": "43", "n": 2, "expect": "19 96" },
+        { "op": "read", "reg": "45", "n": 2, "expect": "00 00" },
+        { "op": "read", "reg": "47", "n": 2, "expect": "00 00" },
+        { "op": "read", "reg": "1B", "n": 1, "expect": "08" },
+        { "op": "read", "reg": "41", "n": 2, "expect": "EF 5C" }
+      ]
+    },
+    {
+      "name": "driver: i2cdevlib MPU6050::initialize(), getMotion6()",
+      "spec": "jrowberg/i2cdevlib MPU6050.cpp initialize(), getMotion6(); I2Cdev.cpp readBytes() ends its pointer write with a STOP, writeBits() reads before it writes",
+      "driver": "i2cdevlib",
+      "steps": [
+        { "op": "write", "data": "6B" },
+        { "op": "get", "n": 1, "expect": "40" },
+        { "op": "write", "data": "6B 41" },
+        { "op": "write", "data": "1B" },
+        { "op": "get", "n": 1, "expect": "00" },
+        { "op": "write", "data": "1B 00" },
+        { "op": "write", "data": "1C" },
+        { "op": "get", "n": 1, "expect": "00" },
+        { "op": "write", "data": "1C 00" },
+        { "op": "write", "data": "6B" },
+        { "op": "get", "n": 1, "expect": "41" },
+        { "op": "write", "data": "6B 01" },
+        { "op": "inputs", "values": { "gyroX": 100 } },
+        { "op": "write", "data": "3B" },
+        { "op": "get", "n": 14, "expect": "00 00 00 00 40 00 EF 5C 33 2C 00 00 00 00" }
+      ]
+    },
+    {
+      "name": "driver: MPU6050_light begin(), update() with the gyro at 65.5 LSB per deg/s",
+      "spec": "rfetick/MPU6050_light MPU6050_light.cpp begin(gyro_config_num = 1, acc_config_num = 0), which ends with an update(); fetchData()",
+      "driver": "mpu6050-light",
+      "steps": [
+        { "op": "write", "data": "6B 01" },
+        { "op": "write", "data": "19 00" },
+        { "op": "write", "data": "1A 00" },
+        { "op": "write", "data": "1B 08" },
+        { "op": "write", "data": "1C 00" },
+        { "op": "read", "reg": "3B", "n": 14, "expect": "00 00 00 00 40 00 EF 5C 00 00 00 00 00 00" },
+        { "op": "inputs", "values": { "gyroX": 100 } },
+        { "op": "read", "reg": "3B", "n": 14, "expect": "00 00 00 00 40 00 EF 5C 19 96 00 00 00 00" }
+      ]
+    }
+  ]
+}

@@ -11,6 +11,8 @@ Verifies that:
 import socket
 import unittest
 
+from app.services.esp32_worker import wifi_nic_arg
+
 
 class TestEsp32C3QemuNicArgs(unittest.TestCase):
     """Test QEMU arg construction for ESP32-C3 with WiFi enabled."""
@@ -18,7 +20,9 @@ class TestEsp32C3QemuNicArgs(unittest.TestCase):
     @staticmethod
     def _simulate_args(wifi_enabled: bool, machine: str = 'esp32c3-picsimlab',
                        hostfwd_port: int = 0) -> list[bytes]:
-        """Simulate arg-building logic from esp32_worker.main() for C3."""
+        """The arguments esp32_worker.main() builds for the C3, with the NIC
+        decided by the shipped wifi_nic_arg: a copy of that decision written
+        here stayed green while every C3 run aborted on the NIC."""
         args = [
             b'qemu-system-riscv32',
             b'-M', machine.encode(),
@@ -26,11 +30,8 @@ class TestEsp32C3QemuNicArgs(unittest.TestCase):
             b'-L', b'/fake/rom',
             b'-drive', b'file=/tmp/fw.bin,if=mtd,format=raw',
         ]
-        if wifi_enabled:
-            nic_model = 'esp32c3_wifi' if 'c3' in machine else 'esp32_wifi'
-            nic_arg = f'user,model={nic_model},net=192.168.4.0/24'
-            if hostfwd_port:
-                nic_arg += f',hostfwd=tcp::{hostfwd_port}-192.168.4.15:80'
+        nic_arg = wifi_nic_arg(machine, wifi_enabled, hostfwd_port)
+        if nic_arg:
             args.extend([b'-nic', nic_arg.encode()])
         return args
 

@@ -33,6 +33,8 @@ stdout        : JSON event lines (one per line, flushed immediately)
                {"type": "rmt_event",    "channel": N, ...}
                {"type": "ws2812_update","channel": N, "pixels": [...]}
                {"type": "i2c_event",    "bus": N, "addr": N, "event": N, "response": N}
+               {"type": "i2c_trace",    "bus": N, "addr": N, "event": N, "op": "...",
+                                        "result": N, "reg_ptr": N}   # VELXIO_I2C_TRACE=1 only
                {"type": "spi_event",    "bus": N, "event": N}
                {"type": "bus_diag",     "code": "...", "bus": N, "owners": [...]}
                {"type": "error",        "message": "..."}
@@ -293,6 +295,20 @@ def _log(msg: str) -> None:
     sys.stderr.flush()
 
 
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, '').strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+# VELXIO_I2C_TRACE=1 in the backend's environment (the worker inherits it):
+# one stderr line and one `i2c_trace` event for every I2C event a model of
+# this worker answers. Off unless asked for, read once. Both are written from
+# the QEMU thread inside the guest's bus transaction, and the log line is a
+# flushed write: measured at about 0.8 ms on top of every register read, and
+# about 1,600 lines a second from a sketch that polls a sensor. Nothing in the
+# tab reads `i2c_trace`; it is there for whoever debugs a driver.
+I2C_TRACE = _env_flag('VELXIO_I2C_TRACE')
+
+
 def refuse_unmodelled_line_sensor(record: dict) -> bool:
     """Answer a line sensor this worker has no model for. True when refused.
 
@@ -400,18 +416,19 @@ _WIFI_MAC_RANGES = ((0x3ff73000, 0x3ff74000), (0x60033000, 0x60034000))
 
 def wifi_nic_arg(machine: str, wifi_enabled: bool,
                  hostfwd_port: int = 0) -> str | None:
-    """The `-nic` value for this machine, or None if it models no radio.
+    """The `-nic` value for this machine, or None if it gets no radio.
 
-    The radio is attached whether or not the sketch appears to use it, because
-    a real ESP32 has one either way. It used to be conditional on wifi_enabled,
-    which made a source-scanning GUESS load-bearing: the fork only instantiates
-    the MAC when a NIC is present (`qemu_find_nic_info(TYPE_ESP32_WIFI)` in
-    hw/xtensa/esp32.c), so a sketch the scanner misread as WiFi-less ran on a
-    machine with nothing mapped at DR_REG_WIFI_BASE. The firmware's first
-    register touch then took an unmapped-peripheral fault — `Guru Meditation
-    Error (LoadStorePIFAddrError)`, EXCVADDR 0x60033c00 — which reads as a
-    Velxio crash and says nothing about WiFi. That is issue #260, and one bad
-    guess was all it took.
+    On the classic ESP32 the radio is attached whether or not the sketch
+    appears to use it, because a real ESP32 has one either way. It used to be
+    conditional on wifi_enabled, which made a source-scanning GUESS
+    load-bearing: the fork only instantiates the MAC when a NIC is present
+    (`qemu_find_nic_info(TYPE_ESP32_WIFI)` in hw/xtensa/esp32.c), so a sketch
+    the scanner misread as WiFi-less ran on a machine with nothing mapped at
+    DR_REG_WIFI_BASE. The firmware's first register touch then took an
+    unmapped-peripheral fault — `Guru Meditation Error
+    (LoadStorePIFAddrError)`, EXCVADDR 0x60033c00 — which reads as a Velxio
+    crash and says nothing about WiFi. That is issue #260, and one bad guess
+    was all it took.
 
     Measured before making it unconditional, on a sketch that never touches
     WiFi: boot time, guest-clock-vs-real-time and container CPU all unchanged
@@ -420,8 +437,23 @@ def wifi_nic_arg(machine: str, wifi_enabled: bool,
 
     `wifi_enabled` still gates the host forward, which exposes the GUEST's
     server to the host and so belongs to a sketch that actually serves.
+
+    The ESP32-C3 is the exception, and gets its radio only when the sketch
+    uses WiFi. The C3 machine of the fork does not survive the NIC: with an
+    esp32c3_wifi NIC present, esp32c3_init_openeth cold-resets the eFuse
+    device before the machine has realized it (hw/riscv/esp32c3_picsimlab.c),
+    the reset reloads the eFuse mirror, and the mirror is only allocated in
+    realize (hw/nvram/esp_efuse.c). The worker died half a second after
+    launch with `esp_efuse_reload_from_blk: Assertion 's->mirror' failed`, on
+    every C3 run since the radio became unconditional, and the tab stayed at
+    "booting". So on this machine the guess is load-bearing again, the other
+    way round: a sketch the scanner reads as WiFi-less boots, and one that
+    uses WiFi still meets the assertion until the fork realizes the eFuse
+    first or the run brings an eFuse drive of its own.
     """
     if 'c3' in machine:
+        if not wifi_enabled:
+            return None
         model = 'esp32c3_wifi'
     elif machine in _WIFI_MACHINES:
         model = 'esp32_wifi'
@@ -816,7 +848,8 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
              '(issue #260), so a pulse-timing driver will time out on it')
 
     # ── WiFi NIC (slirp user-mode networking) ──────────────────────────────
-    # Always present on machines that model a radio — see wifi_nic_arg().
+    # Always present on the classic ESP32, on the C3 only for a sketch that
+    # uses WiFi — see wifi_nic_arg().
     nic_arg = wifi_nic_arg(machine, wifi_enabled, wifi_hostfwd_port)
     if nic_arg:
         args_list.extend([b'-nic', nic_arg.encode()])
@@ -1873,6 +1906,8 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
 
         if slave is not None:
             result  = _i2c_table.event(bus_id, addr, event, found)
+            if not I2C_TRACE:
+                return result
             reg_ptr = getattr(slave, 'reg_ptr', 0)
 
             # Build descriptive annotation
@@ -2935,6 +2970,9 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
             elif sensor_type == 'mpu6050':
                 i2c_addr = int(s.get('addr', 0x68))
                 slave = _MPU6050Slave(i2c_addr)
+                # The record carries where the panel's sliders are, so the
+                # first read is already theirs and not the twin's own rest.
+                slave.update(**s)
                 _i2c_add(gpio, s, slave, i2c_addr)
                 sensor_data['i2c_addr'] = i2c_addr
                 sensor_data['slave'] = slave
@@ -3259,6 +3297,7 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
                 elif sensor_type == 'mpu6050':
                     i2c_addr = int(cmd.get('addr', 0x68))
                     slave = _MPU6050Slave(i2c_addr)
+                    slave.update(**cmd)
                     _i2c_add(gpio, cmd, slave, i2c_addr)
                     sensor_data['i2c_addr'] = i2c_addr
                     sensor_data['slave'] = slave
@@ -3335,15 +3374,9 @@ def main() -> None:  # noqa: C901  (complexity OK for inline worker)
                                 if _unlock_iothread:
                                     _unlock_iothread()
                     elif stype == 'mpu6050' and slave is not None:
-                        slave.update(
-                            accel_x=float(sensor.get('accelX', 0)),
-                            accel_y=float(sensor.get('accelY', 0)),
-                            accel_z=float(sensor.get('accelZ', 1)),
-                            gyro_x =float(sensor.get('gyroX',  0)),
-                            gyro_y =float(sensor.get('gyroY',  0)),
-                            gyro_z =float(sensor.get('gyroZ',  0)),
-                            temp   =float(sensor.get('temp',   25.0)),
-                        )
+                        # Only what this update names: a value it leaves out
+                        # stays where the record or an earlier update put it.
+                        slave.update(**cmd)
                     elif stype == 'bmp280' and slave is not None:
                         slave.update(
                             temperature_c =float(sensor.get('temperature', 25.0)),

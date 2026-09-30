@@ -155,7 +155,11 @@ def main() -> None:
         """Instantiate the right I2C/SPI slave for a sensor descriptor."""
         stype = s.get('sensor_type', '')
         if stype == 'mpu6050':
-            addr = int(s.get('addr', 0x68)); _i2c_slaves[addr] = _MPU6050Slave(addr)
+            addr = int(s.get('addr', 0x68)); sl = _MPU6050Slave(addr)
+            # The record carries where the panel's sliders are, so the first
+            # read is already theirs and not the twin's own rest.
+            sl.update(**s)
+            _i2c_slaves[addr] = sl
         elif stype == 'bmp280':
             addr = int(s.get('addr', 0x76)); sl = _BMP280Slave(addr)
             if 'temperature' in s: sl.update(float(s['temperature']), sl._press_hpa)
@@ -357,13 +361,10 @@ def main() -> None:
                             slave.update(float(rec.get('temperature', 25.0)),
                                          float(rec.get('pressure', 1013.25)))
                         elif stype == 'mpu6050' and slave is not None and hasattr(slave, 'update'):
-                            slave.update(accel_x=float(rec.get('accelX', 0)),
-                                         accel_y=float(rec.get('accelY', 0)),
-                                         accel_z=float(rec.get('accelZ', 1)),
-                                         gyro_x=float(rec.get('gyroX', 0)),
-                                         gyro_y=float(rec.get('gyroY', 0)),
-                                         gyro_z=float(rec.get('gyroZ', 0)),
-                                         temp=float(rec.get('temp', 25.0)))
+                            # Only what this update names: a value it leaves
+                            # out stays where the record or an earlier update
+                            # put it.
+                            slave.update(**cmd)
                         elif stype in ('ds3231',) and slave is not None and hasattr(slave, 'update'):
                             slave.update(float(rec.get('temperature', 25.0)))
                     except Exception as e:

@@ -33,6 +33,7 @@
  *   I2C <bus> <addr> RR <reg> <n>        write reg, repeated start, read n
  *   I2C <bus> <addr> WR <reg> <hex>      write reg + bytes
  *   I2C <bus> <addr> T  <hex|-> <n>      write bytes, repeated start, read n
+ *   I2C ... #<seq>                       the same line, its write numbered by the relay
  *   SPI <bus> <cs> X  <hex>              full-duplex transfer, CS released after
  *   SPI <bus> <cs> XC <hex>              same, CS held low for the next transfer
  *   SPI <bus> <cs> W | WC <hex>          X / XC with nothing waiting for MISO
@@ -93,6 +94,7 @@ import type {
   EngineBinding,
   I2cControllerPort,
   I2cRouting,
+  I2cTarget,
   I2cTransactionHandler,
   SpiControllerConfig,
   SpiControllerPort,
@@ -476,6 +478,22 @@ function parseCount(s: string | undefined): number | null {
   return Number.isInteger(n) && n >= 0 && n <= 4096 ? n : null;
 }
 
+/**
+ * The number a relay put on a write it sent on (`#<seq>`, the last word of
+ * the line), or null. The in-browser engine and a relay from before
+ * 2026-09-29 number nothing.
+ */
+function writeSeqOf(parts: readonly string[]): number | null {
+  const m = /^#(\d+)$/.exec(parts[parts.length - 1] ?? '');
+  return m ? Number(m[1]) : null;
+}
+
+/** A target's 256 registers as the relay takes them, or null when it cannot hand them over. */
+function registersOf(target: I2cTarget): string | null {
+  const dump = (target as { dumpRegisters?: () => Uint8Array }).dumpRegisters;
+  return typeof dump === 'function' ? toHex(Array.from(dump.call(target))) : null;
+}
+
 /** Dallas/Maxim CRC-8 (poly 0x31 reflected), as the w1 kernel driver checks it. */
 function crc8(bytes: readonly number[]): number {
   let crc = 0;
@@ -563,6 +581,13 @@ export class PiBridgeShim {
   private busMapKey = '';
   /** Last registers pushed, by `bus:addr`. */
   private readonly lastRegs = new Map<string, string>();
+  /**
+   * The number of the last write the relay sent to each device, by
+   * `bus:addr`. Every push of that device repeats it, so the relay can drop
+   * one that was computed before a guest's write reached this tab instead of
+   * rolling the write back with it.
+   */
+  private readonly appliedSeq = new Map<string, number>();
 
   constructor(opts: PiBridgeShimOptions) {
     this.boardId = opts.boardId;
@@ -650,9 +675,10 @@ export class PiBridgeShim {
         continue;
       }
       seen.add(key);
-      i2c.push(t);
+      const seq = t.regs === null ? undefined : this.appliedSeq.get(key);
+      i2c.push(seq === undefined ? t : { ...t, seq });
     }
-    return { version: 1, i2c, spi: { attached: this.spiAttached() } };
+    return { version: 2, i2c, spi: { attached: this.spiAttached() } };
   }
 
   /**
@@ -672,9 +698,7 @@ export class PiBridgeShim {
       if (!bus) continue;
       for (const m of bus.members.values()) {
         if (!m.clocked) continue;
-        const dump = (m.target as { dumpRegisters?: () => Uint8Array }).dumpRegisters;
-        const regs =
-          typeof dump === 'function' ? toHex(Array.from(dump.call(m.target))) : null;
+        const regs = registersOf(m.target);
         // Only a chip that can NAK costs its writes a round trip; the rest
         // are ACKed by the relay, which is what keeps a display's frame fast.
         const ask = m.target.mayNak === true ? { ask_writes: true as const } : {};
@@ -699,7 +723,9 @@ export class PiBridgeShim {
    * true. Every 250 ms (the ESP32 proxy's cadence) a changed set of devices
    * republishes the whole map, and a register-file device whose registers
    * changed pushes just its registers — compared byte for byte, because a
-   * sampled hash misses the measurement registers a slider moves.
+   * sampled hash misses the measurement registers a slider moves. A write
+   * the relay sends on does not wait for the tick: see
+   * {@link pushRegsAfterWrite}.
    */
   startBusSync(): void {
     this.stopBusSync();
@@ -733,6 +759,9 @@ export class PiBridgeShim {
     this.busTimer = null;
     this.busMapKey = '';
     this.lastRegs.clear();
+    // The numbers are the relay's, and the next guest's relay counts from
+    // zero: one kept from this guest would pass for a write not yet seen.
+    this.appliedSeq.clear();
   }
 
   private publishBusTopology(): void {
@@ -786,8 +815,52 @@ export class PiBridgeShim {
       const key = `${dev.bus}:${dev.addr}`;
       if (dev.regs === null || this.lastRegs.get(key) === dev.regs) continue;
       this.lastRegs.set(key, dev.regs);
-      bridge.sendBusRegs?.(dev.bus, dev.addr, dev.regs);
+      bridge.sendBusRegs?.(dev.bus, dev.addr, dev.regs, dev.seq);
     }
+  }
+
+  /**
+   * A write with data reached a device the relay mirrors. The relay stored
+   * the bytes as the guest wrote them and cannot know what the chip made of
+   * them, so from that write on it asks this tab for the device's reads,
+   * until the registers arrive with the write's number. They go out now, and
+   * they go out even when they are what was pushed last: a bit that clears
+   * itself (a reset, a one-shot conversion) leaves the registers as they
+   * were, while the relay's copy still has it set, and a driver that polls
+   * the bit would never see it clear.
+   *
+   * A relay from before the numbers sends none and loads whatever it is
+   * pushed, so it is answered the same way, without one.
+   */
+  private pushRegsAfterWrite(bus: number, addr: number, seq: number | null): void {
+    // Nobody mirrors anything for the in-browser engine.
+    if (this.busTimer === null) return;
+    const key = `${bus}:${addr}`;
+    if (seq !== null) this.appliedSeq.set(key, seq);
+    const regs = this.registersAt(bus, addr);
+    if (regs === null) return;
+    this.lastRegs.set(key, regs);
+    (this.bridge as Partial<RaspberryPi3Bridge>).sendBusRegs?.(
+      bus,
+      addr,
+      regs,
+      this.appliedSeq.get(key),
+    );
+  }
+
+  /**
+   * The registers of the device the map publishes at `addr` on `bus`: of the
+   * chips at that address, the one {@link busTopology} lists.
+   */
+  private registersAt(bus: number, addr: number): string | null {
+    if (!this.boundToFabric()) return null;
+    const sda = (this.i2cPorts[bus] as PiI2cPort | undefined)?.routing().sda;
+    if (sda === undefined) return null;
+    const members = busRegistry.fabric(this.boardId).i2cBuses.get(sda)?.members;
+    for (const m of members?.values() ?? []) {
+      if (m.clocked && m.addresses.includes(addr)) return registersOf(m.target);
+    }
+    return null;
   }
 
   /** Which devices are where (not their register contents). */
@@ -1365,7 +1438,9 @@ export class PiBridgeShim {
     }
   }
 
-  private answerI2C(parts: string[]): string | null {
+  private answerI2C(line: string[]): string | null {
+    const seq = writeSeqOf(line);
+    const parts = seq === null ? line : line.slice(0, -1);
     const bus = parseCount(parts[1]);
     const addr = parts[2] !== undefined && /^[0-9a-fA-F]{1,2}$/.test(parts[2]) ? parseInt(parts[2], 16) : null;
     if (bus === null || addr === null) return null;
@@ -1400,7 +1475,14 @@ export class PiBridgeShim {
     }
     if (write === null || readLen === null) return null;
     const addrHex = addr.toString(16).padStart(2, '0');
-    const data = this.i2cExchange(addr, write, readLen, bus);
+    let data: number[] | 'nack' | 'nack-data';
+    try {
+      data = this.i2cExchange(addr, write, readLen, bus);
+    } finally {
+      // More than a register pointer went out, so the device may have
+      // changed; whatever became of the write, the relay waits to hear.
+      if (write.length > 1) this.pushRegsAfterWrite(bus, addr, seq);
+    }
     if (data === 'nack') return `I2C_ERR ${bus} ${addrHex} nack`;
     // `nack` stays the fourth word, which is all velxio-busd and the tab's
     // fcntl shim read (both raise EREMOTEIO on it); the fifth says the address
